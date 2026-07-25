@@ -983,6 +983,8 @@ function Format-BreakLine {
         $breakTypeText,
         $urlText).Trim()
 
+    $line = $line -replace '\s+[-|–—]+\s*・\s*(?=Random\s+President\b)', ' - '
+    $line = $line -replace '\s+[-|–—]+\s*・\s*', ' '
     $line = $line -replace '\s*・\s*', ' '
     $line = $line -replace '\s+[-|–—]+\s+(?=(?:\S+\s+)?\((?:\?|\d+)\s+spots\))', ' '
     $line = $line -replace '\s{2,}', ' '
