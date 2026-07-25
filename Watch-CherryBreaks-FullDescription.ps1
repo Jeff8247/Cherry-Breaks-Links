@@ -645,7 +645,7 @@ function Get-ProductTitle {
                 -Text $match.Groups['title'].Value
 
             $title = $title `
-                -replace '\s*[–|-]\s*Cherry Collectables.*$', ''
+                -replace ("\s*[$([char]0x2013)|-]\s*Cherry Collectables.*$"), ''
 
             if ($title) {
                 return $title.Trim()
@@ -854,9 +854,14 @@ function Get-FullBreakDescription {
     $description = $description -replace '(?i)\b(?:Random\s+Wreslet)\b', ' '
 
     # Clean separators and whitespace left behind by removed metadata.
-    $description = $description -replace '\s*・\s*', ' '
-    $description = $description -replace '[\s\p{Zs}]*[-|・–—]+(?:[\s\p{Zs}]*[-|・–—]+)*[\s\p{Zs}]*$', ' '
-    $description = $description -replace '^[\s\p{Zs}]*[-|・–—]+(?:[\s\p{Zs}]*[-|・–—]+)*[\s\p{Zs}]*', ' '
+    $middleDot = [regex]::Escape([string][char]0x30FB)
+    $separatorChars = '\-\|' + $middleDot +
+        [regex]::Escape([string][char]0x2013) +
+        [regex]::Escape([string][char]0x2014)
+
+    $description = $description -replace "\s*$middleDot\s*", ' '
+    $description = $description -replace "[\s\p{Zs}]*[$separatorChars]+(?:[\s\p{Zs}]*[$separatorChars]+)*[\s\p{Zs}]*$", ' '
+    $description = $description -replace "^[\s\p{Zs}]*[$separatorChars]+(?:[\s\p{Zs}]*[$separatorChars]+)*[\s\p{Zs}]*", ' '
     $description = $description -replace '\s+', ' '
     $description = $description.Trim()
 
@@ -983,10 +988,15 @@ function Format-BreakLine {
         $breakTypeText,
         $urlText).Trim()
 
-    $line = $line -replace '\s+[-|–—]+\s*・\s*(?=Random\s+President\b)', ' - '
-    $line = $line -replace '\s+[-|–—]+\s*・\s*', ' '
-    $line = $line -replace '\s*・\s*', ' '
-    $line = $line -replace '\s+[-|–—]+\s+(?=(?:\S+\s+)?\((?:\?|\d+)\s+spots\))', ' '
+    $middleDot = [regex]::Escape([string][char]0x30FB)
+    $separatorChars = '\-\|' +
+        [regex]::Escape([string][char]0x2013) +
+        [regex]::Escape([string][char]0x2014)
+
+    $line = $line -replace "\s+[$separatorChars]+\s*$middleDot\s*(?=Random\s+President\b)", ' - '
+    $line = $line -replace "\s+[$separatorChars]+\s*$middleDot\s*", ' '
+    $line = $line -replace "\s*$middleDot\s*", ' '
+    $line = $line -replace "\s+[$separatorChars]+\s+(?=(?:\S+\s+)?\((?:\?|\d+)\s+spots\))", ' '
     $line = $line -replace '\s{2,}', ' '
 
     return $line
