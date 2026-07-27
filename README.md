@@ -9,6 +9,9 @@ clean, ready-to-share break lines.
 - Uses Sydney time when deciding today's date.
 - Prints each break with description, sport emoji, spots left, break number,
   allocation suffix where useful, and product URL.
+- Can produce YouTube-friendly break lines capped at 200 characters while
+  keeping spots, break number, allocation suffix, and product URL intact.
+- Prints a selected day's live openings collection link when `-Day` is used.
 - Sorts results from least spots left to most spots left.
 - Cleans noisy title metadata such as dates, `Team Based`, `Random Type`,
   `Random Character`, duplicated separators, and Cherry's `・` separator.
@@ -40,6 +43,12 @@ Check a specific weekday:
 .\Watch-CherryBreaks-FullDescription.ps1 -Day Monday
 ```
 
+The selected weekday output includes that day's live openings collection link:
+
+```text
+Tonights Live Openings (Plz Check Dates) -> https://www.cherrycollectables.com.au/collections/Monday
+```
+
 Save results to a text file:
 
 ```powershell
@@ -47,3 +56,12 @@ Save results to a text file:
 ```
 
 `-OutputPath` overwrites the target file each run.
+
+Create YouTube-friendly output capped at 200 characters per break line:
+
+```powershell
+.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -YouTube
+```
+
+When `-YouTube` is used, only the break description is shortened. The spots,
+sport emoji, break number, allocation suffix, and full product URL are kept.

@@ -14,6 +14,7 @@ Examples:
 .\Watch-CherryBreaks-PowerShell51.ps1
 .\Watch-CherryBreaks-PowerShell51.ps1 -Day Friday
 .\Watch-CherryBreaks-PowerShell51.ps1 -Day Friday -OutputPath cherry-break-results.txt
+.\Watch-CherryBreaks-PowerShell51.ps1 -Day Friday -YouTube
 
 -OutputPath overwrites the text file every run.
 #>
@@ -31,11 +32,14 @@ param(
     )]
     [string]$Day,
 
-    [string]$OutputPath
+    [string]$OutputPath,
+
+    [switch]$YouTube
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$DayWasExplicitlyRequested = $PSBoundParameters.ContainsKey('Day')
 
 [Net.ServicePointManager]::SecurityProtocol = `
     [Net.ServicePointManager]::SecurityProtocol -bor `
@@ -931,10 +935,87 @@ function Get-BreakSportEmoji {
     return ''
 }
 
+function Get-DayCollectionUrl {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Day
+    )
+
+    return "$BaseUrl/collections/$Day"
+}
+
+function Get-DayCollectionLine {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Day
+    )
+
+    return 'Tonights Live Openings (Plz Check Dates) -> {0}' -f `
+        (Get-DayCollectionUrl -Day $Day)
+}
+
+function Normalize-BreakLine {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Line
+    )
+
+    $middleDot = [regex]::Escape([string][char]0x30FB)
+    $separatorChars = '\-\|' +
+        [regex]::Escape([string][char]0x2013) +
+        [regex]::Escape([string][char]0x2014)
+
+    $line = $Line.Trim()
+    $line = $line -replace "\s+[$separatorChars]+\s*$middleDot\s*(?=Random\s+President\b)", ' - '
+    $line = $line -replace "\s+[$separatorChars]+\s*$middleDot\s*", ' '
+    $line = $line -replace "\s*$middleDot\s*", ' '
+    $line = $line -replace "\s+[$separatorChars]+\s+(?=(?:\S+\s+)?\((?:\?|\d+)\s+spots\))", ' '
+    $line = $line -replace '\s{2,}', ' '
+
+    return $line.Trim()
+}
+
+function Join-BreakLine {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Description,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$SportEmoji,
+
+        [Parameter(Mandatory)]
+        [string]$SpotsText,
+
+        [Parameter(Mandatory)]
+        [string]$BreakNumber,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$BreakTypeText,
+
+        [Parameter(Mandatory)]
+        [string]$UrlText
+    )
+
+    $line = ('{0} {1} {2} {3}{4} -> {5}' -f `
+        $Description,
+        $SportEmoji,
+        $SpotsText,
+        $BreakNumber,
+        $BreakTypeText,
+        $UrlText)
+
+    return Normalize-BreakLine -Line $line
+}
+
 function Format-BreakLine {
     param(
         [Parameter(Mandatory)]
-        [pscustomobject]$Item
+        [pscustomobject]$Item,
+
+        [switch]$YouTube
     )
 
     $uri = [uri]$Item.Url
@@ -981,24 +1062,42 @@ function Format-BreakLine {
         ''
     }
 
-    $line = ('{0} {1} {2} {3}{4} -> {5}' -f `
-        $description,
-        $sportEmoji,
-        $spotsText,
-        $breakNumber,
-        $breakTypeText,
-        $urlText).Trim()
+    $line = Join-BreakLine `
+        -Description $description `
+        -SportEmoji $sportEmoji `
+        -SpotsText $spotsText `
+        -BreakNumber $breakNumber `
+        -BreakTypeText $breakTypeText `
+        -UrlText $urlText
 
-    $middleDot = [regex]::Escape([string][char]0x30FB)
-    $separatorChars = '\-\|' +
-        [regex]::Escape([string][char]0x2013) +
-        [regex]::Escape([string][char]0x2014)
+    if ($YouTube -and $line.Length -gt 200) {
+        $fixedLine = Join-BreakLine `
+            -Description '' `
+            -SportEmoji $sportEmoji `
+            -SpotsText $spotsText `
+            -BreakNumber $breakNumber `
+            -BreakTypeText $breakTypeText `
+            -UrlText $urlText
 
-    $line = $line -replace "\s+[$separatorChars]+\s*$middleDot\s*(?=Random\s+President\b)", ' - '
-    $line = $line -replace "\s+[$separatorChars]+\s*$middleDot\s*", ' '
-    $line = $line -replace "\s*$middleDot\s*", ' '
-    $line = $line -replace "\s+[$separatorChars]+\s+(?=(?:\S+\s+)?\((?:\?|\d+)\s+spots\))", ' '
-    $line = $line -replace '\s{2,}', ' '
+        $separatorLength = if ($fixedLine) { 1 } else { 0 }
+        $descriptionLength = 200 - $fixedLine.Length - $separatorLength
+
+        if ($descriptionLength -lt 0) {
+            $descriptionLength = 0
+        }
+
+        if ($description.Length -gt $descriptionLength) {
+            $description = $description.Substring(0, $descriptionLength).Trim()
+        }
+
+        $line = Join-BreakLine `
+            -Description $description `
+            -SportEmoji $sportEmoji `
+            -SpotsText $spotsText `
+            -BreakNumber $breakNumber `
+            -BreakTypeText $breakTypeText `
+            -UrlText $urlText
+    }
 
     return $line
 }
@@ -1010,7 +1109,11 @@ function Show-BreakResults {
         [object[]]$Results,
 
         [Parameter(Mandatory)]
-        [string]$Day
+        [string]$Day,
+
+        [switch]$YouTube,
+
+        [switch]$IncludeDayCollectionLink
     )
 
     $sydneyDate = Get-SydneyDate
@@ -1023,6 +1126,10 @@ function Show-BreakResults {
         $targetDate.ToString('dd MMM yyyy'),
         $sydneyDate.ToString('dd MMM yyyy HH:mm')
     ) -ForegroundColor Cyan
+
+    if ($IncludeDayCollectionLink) {
+        Write-Host (Get-DayCollectionLine -Day $Day) -ForegroundColor Cyan
+    }
 
     Write-Host ''
 
@@ -1039,7 +1146,9 @@ function Show-BreakResults {
             default { 'Green' }
         }
 
-        $line = Format-BreakLine -Item $item
+        $line = Format-BreakLine `
+            -Item $item `
+            -YouTube:$YouTube
 
         Write-Host $line -ForegroundColor $statusColour
     }
@@ -1065,7 +1174,11 @@ function Save-TextResults {
         [object[]]$Results,
 
         [Parameter(Mandatory)]
-        [string]$Day
+        [string]$Day,
+
+        [switch]$YouTube,
+
+        [switch]$IncludeDayCollectionLink
     )
 
     if (-not $OutputPath) {
@@ -1083,13 +1196,19 @@ function Save-TextResults {
             $targetDate.ToString('dd MMM yyyy'))
     )
 
+    if ($IncludeDayCollectionLink) {
+        $lines.Add((Get-DayCollectionLine -Day $Day))
+    }
+
     if (-not $Results) {
         $lines.Add('No matching breaks were found.')
     }
     else {
         foreach ($item in $Results) {
             $lines.Add(
-                (Format-BreakLine -Item $item)
+                (Format-BreakLine `
+                    -Item $item `
+                    -YouTube:$YouTube)
             )
         }
     }
@@ -1220,11 +1339,15 @@ function Invoke-BreakCheck {
 
     Show-BreakResults `
         -Results $allResults `
-        -Day $targetDay
+        -Day $targetDay `
+        -YouTube:$YouTube `
+        -IncludeDayCollectionLink:$DayWasExplicitlyRequested
 
     Save-TextResults `
         -Results $allResults `
-        -Day $targetDay
+        -Day $targetDay `
+        -YouTube:$YouTube `
+        -IncludeDayCollectionLink:$DayWasExplicitlyRequested
 
     return $allResults
 }
