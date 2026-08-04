@@ -877,6 +877,15 @@ function Get-FullBreakDescription {
     return $description
 }
 
+function Test-DailyBreak {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Item
+    )
+
+    return $null -ne (Get-DailyBreakName -Title $Item.Title)
+}
+
 function Get-BreakSportEmoji {
     param(
         [Parameter(Mandatory)]
@@ -1102,6 +1111,51 @@ function Format-BreakLine {
     return $line
 }
 
+function Get-BreakResultGroups {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Results
+    )
+
+    $dailyResults = @(
+        $Results |
+            Where-Object { Test-DailyBreak -Item $_ }
+    )
+
+    $otherResults = @(
+        $Results |
+            Where-Object { -not (Test-DailyBreak -Item $_) }
+    )
+
+    return [pscustomobject]@{
+        Dailies = $dailyResults
+        Other   = $otherResults
+    }
+}
+
+function Write-BreakResultLine {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Item,
+
+        [switch]$YouTube
+    )
+
+    $statusColour = switch ($Item.SpotsLeft) {
+        0       { 'DarkGray' }
+        { $_ -le 3 }  { 'Red' }
+        { $_ -le 10 } { 'Yellow' }
+        default { 'Green' }
+    }
+
+    $line = Format-BreakLine `
+        -Item $Item `
+        -YouTube:$YouTube
+
+    Write-Host $line -ForegroundColor $statusColour
+}
+
 function Show-BreakResults {
     param(
         [Parameter(Mandatory)]
@@ -1138,19 +1192,30 @@ function Show-BreakResults {
         return
     }
 
-    foreach ($item in $Results) {
-        $statusColour = switch ($item.SpotsLeft) {
-            0       { 'DarkGray' }
-            { $_ -le 3 }  { 'Red' }
-            { $_ -le 10 } { 'Yellow' }
-            default { 'Green' }
+    $groups = Get-BreakResultGroups -Results $Results
+
+    if ($groups.Dailies) {
+        Write-Host 'Dailies' -ForegroundColor Cyan
+
+        foreach ($item in $groups.Dailies) {
+            Write-BreakResultLine `
+                -Item $item `
+                -YouTube:$YouTube
         }
 
-        $line = Format-BreakLine `
-            -Item $item `
-            -YouTube:$YouTube
+        if ($groups.Other) {
+            Write-Host ''
+        }
+    }
 
-        Write-Host $line -ForegroundColor $statusColour
+    if ($groups.Other) {
+        Write-Host 'Other Breaks' -ForegroundColor Cyan
+
+        foreach ($item in $groups.Other) {
+            Write-BreakResultLine `
+                -Item $item `
+                -YouTube:$YouTube
+        }
     }
 }
 
@@ -1204,12 +1269,34 @@ function Save-TextResults {
         $lines.Add('No matching breaks were found.')
     }
     else {
-        foreach ($item in $Results) {
-            $lines.Add(
-                (Format-BreakLine `
-                    -Item $item `
-                    -YouTube:$YouTube)
-            )
+        $groups = Get-BreakResultGroups -Results $Results
+
+        if ($groups.Dailies) {
+            $lines.Add('Dailies')
+
+            foreach ($item in $groups.Dailies) {
+                $lines.Add(
+                    (Format-BreakLine `
+                        -Item $item `
+                        -YouTube:$YouTube)
+                )
+            }
+
+            if ($groups.Other) {
+                $lines.Add('')
+            }
+        }
+
+        if ($groups.Other) {
+            $lines.Add('Other Breaks')
+
+            foreach ($item in $groups.Other) {
+                $lines.Add(
+                    (Format-BreakLine `
+                        -Item $item `
+                        -YouTube:$YouTube)
+                )
+            }
         }
     }
 
