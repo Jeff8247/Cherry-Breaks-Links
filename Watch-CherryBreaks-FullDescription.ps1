@@ -857,6 +857,7 @@ function Get-FullBreakDescription {
     $description = $description -replace '(?i)\b(?:Random\s+Characters?)\b', ' '
     $description = $description -replace '(?i)\b(?:Random\s+Wreslet)\b', ' '
     $description = $description -replace '(?i)\bOpening\b', ' '
+    $description = $description -replace '(?i)\b(?<count>\d+)\s*-?\s*Box(?:es)?\b', '(${count})'
 
     # Clean separators and whitespace left behind by removed metadata.
     $middleDot = [regex]::Escape([string][char]0x30FB)
