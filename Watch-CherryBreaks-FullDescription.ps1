@@ -954,6 +954,15 @@ function Get-DayCollectionUrl {
     return "$BaseUrl/collections/$Day"
 }
 
+function Get-DayProductsCollectionUrl {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Day
+    )
+
+    return "$(Get-DayCollectionUrl -Day $Day)?sort=creation_date"
+}
+
 function Get-DayCollectionLine {
     param(
         [Parameter(Mandatory)]
@@ -1347,6 +1356,23 @@ function Invoke-BreakCheck {
             -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
 
         foreach ($productUrl in $productLinks) {
+            [void]$productLinkSet.Add($productUrl)
+        }
+
+        $dayProductsCollectionUrl = Get-DayProductsCollectionUrl `
+            -Day $targetDay
+
+        Write-Verbose (
+            "Checking day collection for live openings matching " +
+            "$targetDay`: $dayProductsCollectionUrl"
+        )
+
+        $dayProductLinks = @(
+            Get-ProductLinks `
+                -CollectionUrl $dayProductsCollectionUrl
+        )
+
+        foreach ($productUrl in $dayProductLinks) {
             [void]$productLinkSet.Add($productUrl)
         }
 
