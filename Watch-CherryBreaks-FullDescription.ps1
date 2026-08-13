@@ -232,12 +232,13 @@ function Test-ProductMatchesDayFallback {
 function Invoke-CherryRequest {
     param(
         [Parameter(Mandatory)]
-        [string]$Uri
+        [string]$Uri,
+
+        [ValidateRange(1, 10)]
+        [int]$MaximumAttempts = 3
     )
 
-    $maximumAttempts = 3
-
-    for ($attempt = 1; $attempt -le $maximumAttempts; $attempt++) {
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
         try {
             return Invoke-WebRequest `
                 -Uri $Uri `
@@ -247,8 +248,19 @@ function Invoke-CherryRequest {
                 -UseBasicParsing
         }
         catch {
-            if ($attempt -eq $maximumAttempts) {
-                throw
+            if ($attempt -eq $MaximumAttempts) {
+                Write-Verbose (
+                    "PowerShell request failed for '$Uri'. " +
+                    "Trying native curl fallback. " +
+                    "Error: $($_.Exception.Message)"
+                )
+
+                try {
+                    return Invoke-CherryCurlRequest -Uri $Uri
+                }
+                catch {
+                    throw
+                }
             }
 
             Write-Warning (
@@ -259,6 +271,70 @@ function Invoke-CherryRequest {
 
             Start-Sleep -Seconds ($attempt * 2)
         }
+    }
+}
+
+function Get-CollectionProductsJsonUrl {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CollectionUrl
+    )
+
+    $uri = [uri]$CollectionUrl
+    $path = $uri.AbsolutePath.TrimEnd('/')
+
+    if ($path -notmatch '^/collections/[^/]+$') {
+        return $null
+    }
+
+    return "$BaseUrl$path/products.json?limit=250"
+}
+
+function Get-NativeCurlCommand {
+    $commands = @(
+        Get-Command curl.exe -ErrorAction SilentlyContinue
+        Get-Command curl -ErrorAction SilentlyContinue
+    )
+
+    return @(
+        $commands |
+            Where-Object { $_.CommandType -eq 'Application' }
+    ) | Select-Object -First 1
+}
+
+function Invoke-CherryCurlRequest {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri
+    )
+
+    $curlCommand = Get-NativeCurlCommand
+
+    if (-not $curlCommand) {
+        throw 'Native curl was not found.'
+    }
+
+    $arguments = @(
+        '--location',
+        '--silent',
+        '--show-error',
+        '--fail',
+        '--max-time',
+        '45',
+        '--user-agent',
+        $Headers['User-Agent'],
+        $Uri
+    )
+
+    $content = & $curlCommand.Source @arguments
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "curl exited with code $LASTEXITCODE."
+    }
+
+    return [pscustomobject]@{
+        Content    = ($content -join [Environment]::NewLine)
+        StatusCode = $null
     }
 }
 
@@ -345,7 +421,9 @@ function Get-ProductJson {
 
     try {
         Write-Verbose "Loading product JSON: $productJsonUrl"
-        $jsonResponse = Invoke-CherryRequest -Uri $productJsonUrl
+        $jsonResponse = Invoke-CherryRequest `
+            -Uri $productJsonUrl `
+            -MaximumAttempts 1
         $product = $jsonResponse.Content | ConvertFrom-Json
         $ProductJsonCache[$ProductUrl] = $product
 
@@ -513,6 +591,86 @@ function Get-FastSimonGridUrl {
     return $gridUrl
 }
 
+function Add-ProductUrl {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.HashSet[string]]$ProductUrls,
+
+        [Parameter(Mandatory)]
+        [string]$Href
+    )
+
+    $href = $Href `
+        -replace '\\u0026', '&' `
+        -replace '\\/', '/'
+
+    if ($href -notmatch '/products/') {
+        return $false
+    }
+
+    $absoluteUrl = ConvertTo-AbsoluteProductUrl -Href $href
+    $canonicalUrl = Get-CanonicalProductUrl -Url $absoluteUrl
+
+    return $ProductUrls.Add($canonicalUrl)
+}
+
+function Add-ProductLinksFromCollectionJson {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.HashSet[string]]$ProductUrls,
+
+        [Parameter(Mandatory)]
+        [string]$CollectionUrl
+    )
+
+    $productsJsonUrl = Get-CollectionProductsJsonUrl `
+        -CollectionUrl $CollectionUrl
+
+    if (-not $productsJsonUrl) {
+        return 0
+    }
+
+    $addedCount = 0
+    $maximumPages = 10
+
+    for ($page = 1; $page -le $maximumPages; $page++) {
+        $pageUrl = Set-QueryParameter `
+            -Url $productsJsonUrl `
+            -Name 'page' `
+            -Value $page
+
+        Write-Verbose "Loading collection products JSON page $page`: $pageUrl"
+
+        $response = Invoke-CherryRequest `
+            -Uri $pageUrl `
+            -MaximumAttempts 1
+        $json = $response.Content | ConvertFrom-Json
+        $products = @($json.products)
+
+        foreach ($product in $products) {
+            if (-not $product.handle) {
+                continue
+            }
+
+            $productUrl = "$BaseUrl/products/$($product.handle)"
+
+            if (Add-ProductUrl `
+                    -ProductUrls $ProductUrls `
+                    -Href $productUrl) {
+                $addedCount++
+            }
+        }
+
+        if ($products.Count -lt 250) {
+            break
+        }
+    }
+
+    return $addedCount
+}
+
 function Get-ProductLinks {
     param(
         [Parameter(Mandatory)]
@@ -521,16 +679,33 @@ function Get-ProductLinks {
 
     Write-Verbose "Loading collection page: $CollectionUrl"
 
-    $response = Invoke-CherryRequest -Uri $CollectionUrl
-    $html = $response.Content
+    $productUrls = New-Object `
+        -TypeName 'System.Collections.Generic.HashSet[string]' `
+        -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+
+    try {
+        $response = Invoke-CherryRequest `
+            -Uri $CollectionUrl `
+            -MaximumAttempts 1
+        $html = $response.Content
+    }
+    catch {
+        Write-Warning (
+            "Collection HTML request failed for '$CollectionUrl'. " +
+            "Trying Shopify products JSON fallback. " +
+            "Error: $($_.Exception.Message)"
+        )
+
+        [void](Add-ProductLinksFromCollectionJson `
+            -ProductUrls $productUrls `
+            -CollectionUrl $CollectionUrl)
+
+        return @($productUrls | Sort-Object)
+    }
 
     $fastSimonGridUrl = Get-FastSimonGridUrl `
         -Html $html `
         -CollectionUrl $CollectionUrl
-
-    $productUrls = New-Object `
-        -TypeName 'System.Collections.Generic.HashSet[string]' `
-        -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
 
     # Match rendered product-card links. The base collection HTML can contain
     # unrelated fallback/product JSON, so prefer the Fast Simon grid HTML above.
@@ -552,20 +727,9 @@ function Get-ProductLinks {
                 $pattern,
                 [Text.RegularExpressions.RegexOptions]::IgnoreCase
             )) {
-                $href = $match.Groups['href'].Value
-
-                $href = $href `
-                    -replace '\\u0026', '&' `
-                    -replace '\\/', '/'
-
-                if ($href -notmatch '/products/') {
-                    continue
-                }
-
-                $absoluteUrl = ConvertTo-AbsoluteProductUrl -Href $href
-                $canonicalUrl = Get-CanonicalProductUrl -Url $absoluteUrl
-
-                if ($productUrls.Add($canonicalUrl)) {
+                if (Add-ProductUrl `
+                        -ProductUrls $productUrls `
+                        -Href $match.Groups['href'].Value) {
                     $addedCount++
                 }
             }
@@ -734,7 +898,9 @@ function Get-CherryBreak {
             $spotResult = Get-SpotsLeftFromProductJson -Product $product
         }
         else {
-            $response = Invoke-CherryRequest -Uri $ProductUrl
+            $response = Invoke-CherryRequest `
+                -Uri $ProductUrl `
+                -MaximumAttempts 1
             $html = $response.Content
 
             $title = Get-ProductTitle -Html $html
