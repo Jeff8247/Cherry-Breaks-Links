@@ -1214,13 +1214,23 @@ function Format-BreakLine {
     $description = Get-FullBreakDescription -Title $Item.Title
     $sportEmoji = Get-BreakSportEmoji -Title $Item.Title
 
-    # A number in parentheses is the number of spots, without the word
-    # "left", matching the shorter preferred output style.
+    $isDailyBreak = Test-DailyBreak -Item $Item
+
     $spotsText = if ($null -eq $Item.SpotsLeft) {
-        '(? spots)'
+        if ($isDailyBreak) {
+            '(? spots left)'
+        }
+        else {
+            '(? spots)'
+        }
     }
     else {
-        "($($Item.SpotsLeft) spots)"
+        if ($isDailyBreak) {
+            "($($Item.SpotsLeft) spots left)"
+        }
+        else {
+            "($($Item.SpotsLeft) spots)"
+        }
     }
 
     # Only show the compact suffix for alternative random allocation types.
