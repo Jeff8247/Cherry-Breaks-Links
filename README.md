@@ -65,6 +65,27 @@ Save results to a text file:
 
 `-OutputPath` overwrites the target file each run.
 
+### Dailies and Weeklies
+
+Show only daily breaks with spots left for the selected day:
+
+```powershell
+.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies
+```
+
+Show only weekly breaks with spots left. Weeklies are searched from the broader
+group-break listings, not only the selected day:
+
+```powershell
+.\Watch-CherryBreaks-FullDescription.ps1 -Weeklies
+```
+
+Show selected-day Dailies plus broader Weeklies:
+
+```powershell
+.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Weeklies
+```
+
 Create YouTube-friendly output capped at 200 characters per break line:
 
 ```powershell
