@@ -15,6 +15,7 @@ Examples:
 .\Watch-CherryBreaks-PowerShell51.ps1 -Day Friday
 .\Watch-CherryBreaks-PowerShell51.ps1 -Day Friday -OutputPath cherry-break-results.txt
 .\Watch-CherryBreaks-PowerShell51.ps1 -Day Friday -YouTube
+.\Watch-CherryBreaks-PowerShell51.ps1 -Day Friday -Dailies -Twitch
 
 -OutputPath overwrites the text file every run.
 #>
@@ -34,7 +35,23 @@ param(
 
     [string]$OutputPath,
 
-    [switch]$YouTube
+    [switch]$YouTube,
+
+    [switch]$Dailies,
+
+    [switch]$Twitch,
+
+    [string]$TwitchChannel,
+
+    [Alias('TwitchBotUser')]
+    [string]$TwitchUser,
+
+    [string]$TwitchOAuthToken,
+
+    [ValidateRange(1, 30)]
+    [int]$TwitchMessageDelaySeconds = 2,
+
+    [string]$EnvPath = '.env'
 )
 
 Set-StrictMode -Version Latest
@@ -54,6 +71,122 @@ $Headers = @{
 }
 
 $ProductJsonCache = @{}
+
+function Resolve-ScriptRelativePath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if ([System.IO.Path]::IsPathRooted($Path)) {
+        return $Path
+    }
+
+    return Join-Path $PSScriptRoot $Path
+}
+
+function ConvertFrom-DotEnvValue {
+    param(
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    $trimmed = $Value.Trim()
+
+    if ($trimmed.Length -ge 2) {
+        $first = $trimmed.Substring(0, 1)
+        $last = $trimmed.Substring($trimmed.Length - 1, 1)
+
+        if (($first -eq '"' -and $last -eq '"') -or
+            ($first -eq "'" -and $last -eq "'")) {
+            return $trimmed.Substring(1, $trimmed.Length - 2)
+        }
+    }
+
+    return $trimmed
+}
+
+function Import-DotEnvFile {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $resolvedPath = Resolve-ScriptRelativePath -Path $Path
+    $values = @{}
+
+    if (-not (Test-Path -LiteralPath $resolvedPath)) {
+        return $values
+    }
+
+    foreach ($line in Get-Content -LiteralPath $resolvedPath) {
+        $trimmedLine = $line.Trim()
+
+        if (-not $trimmedLine -or $trimmedLine.StartsWith('#')) {
+            continue
+        }
+
+        $match = [regex]::Match(
+            $trimmedLine,
+            '^\s*(?:export\s+)?(?<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?<value>.*)\s*$'
+        )
+
+        if (-not $match.Success) {
+            continue
+        }
+
+        $name = $match.Groups['name'].Value
+        $value = ConvertFrom-DotEnvValue -Value $match.Groups['value'].Value
+        $values[$name] = $value
+    }
+
+    return $values
+}
+
+function Get-ConfigValue {
+    param(
+        [AllowEmptyString()]
+        [string]$CurrentValue,
+
+        [Parameter(Mandatory)]
+        [hashtable]$DotEnvValues,
+
+        [Parameter(Mandatory)]
+        [string[]]$Names
+    )
+
+    if ($CurrentValue) {
+        return $CurrentValue
+    }
+
+    foreach ($name in $Names) {
+        if ($DotEnvValues.ContainsKey($name) -and $DotEnvValues[$name]) {
+            return [string]$DotEnvValues[$name]
+        }
+
+        $environmentValue = [Environment]::GetEnvironmentVariable($name)
+
+        if ($environmentValue) {
+            return $environmentValue
+        }
+    }
+
+    return $CurrentValue
+}
+
+$DotEnvValues = Import-DotEnvFile -Path $EnvPath
+$TwitchChannel = Get-ConfigValue `
+    -CurrentValue $TwitchChannel `
+    -DotEnvValues $DotEnvValues `
+    -Names @('TWITCH_CHANNEL')
+$TwitchUser = Get-ConfigValue `
+    -CurrentValue $TwitchUser `
+    -DotEnvValues $DotEnvValues `
+    -Names @('TWITCH_USER', 'TWITCH_BOT_USER')
+$TwitchOAuthToken = Get-ConfigValue `
+    -CurrentValue $TwitchOAuthToken `
+    -DotEnvValues $DotEnvValues `
+    -Names @('TWITCH_OAUTH_TOKEN')
 
 function Get-SydneyDate {
     $timeZone = [TimeZoneInfo]::FindSystemTimeZoneById(
@@ -1506,6 +1639,156 @@ function Save-TextResults {
     ) -ForegroundColor Green
 }
 
+function Get-TwitchChatLine {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Item,
+
+        [switch]$YouTube
+    )
+
+    return Format-BreakLine `
+        -Item $Item `
+        -YouTube:$YouTube
+}
+
+function Send-TwitchChatMessages {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Channel,
+
+        [Parameter(Mandatory)]
+        [string]$User,
+
+        [Parameter(Mandatory)]
+        [string]$OAuthToken,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Messages,
+
+        [ValidateRange(1, 30)]
+        [int]$DelaySeconds = 2
+    )
+
+    if (-not $Messages) {
+        Write-Host 'No Twitch messages to send.' -ForegroundColor Yellow
+        return
+    }
+
+    $cleanChannel = $Channel.Trim().TrimStart('#').ToLowerInvariant()
+    $cleanUser = $User.Trim().ToLowerInvariant()
+    $cleanToken = $OAuthToken.Trim()
+
+    if (-not $cleanToken.StartsWith('oauth:', [StringComparison]::OrdinalIgnoreCase)) {
+        $cleanToken = "oauth:$cleanToken"
+    }
+
+    $tcpClient = New-Object System.Net.Sockets.TcpClient
+    $sslStream = $null
+    $writer = $null
+
+    try {
+        $tcpClient.Connect('irc.chat.twitch.tv', 6697)
+
+        $sslStream = New-Object `
+            System.Net.Security.SslStream(
+                $tcpClient.GetStream(),
+                $false,
+                ({ $true } -as [Net.Security.RemoteCertificateValidationCallback])
+            )
+
+        $sslStream.AuthenticateAsClient('irc.chat.twitch.tv')
+
+        $writer = New-Object `
+            System.IO.StreamWriter(
+                $sslStream,
+                [System.Text.Encoding]::UTF8
+            )
+        $writer.NewLine = "`r`n"
+        $writer.AutoFlush = $true
+
+        $writer.WriteLine("PASS $cleanToken")
+        $writer.WriteLine("NICK $cleanUser")
+        $writer.WriteLine("JOIN #$cleanChannel")
+
+        Start-Sleep -Seconds 2
+
+        foreach ($message in $Messages) {
+            $writer.WriteLine("PRIVMSG #$cleanChannel :$message")
+            Write-Host "Sent Twitch chat message: $message" -ForegroundColor Green
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+    finally {
+        if ($null -ne $writer) {
+            $writer.Dispose()
+        }
+
+        if ($null -ne $sslStream) {
+            $sslStream.Dispose()
+        }
+
+        $tcpClient.Dispose()
+    }
+}
+
+function Publish-TwitchResults {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Results,
+
+        [switch]$YouTube
+    )
+
+    if (-not $Twitch) {
+        return
+    }
+
+    $missingSettings = @()
+
+    if (-not $TwitchChannel) {
+        $missingSettings += 'TWITCH_CHANNEL'
+    }
+
+    if (-not $TwitchUser) {
+        $missingSettings += 'TWITCH_USER'
+    }
+
+    if (-not $TwitchOAuthToken) {
+        $missingSettings += 'TWITCH_OAUTH_TOKEN'
+    }
+
+    if ($missingSettings) {
+        throw (
+            'Twitch sending was requested, but these setting(s) are missing: ' +
+            ($missingSettings -join ', ')
+        )
+    }
+
+    $messages = @(
+        $Results |
+            Where-Object {
+                (Test-DailyBreak -Item $_) -and
+                $null -ne $_.SpotsLeft -and
+                $_.SpotsLeft -gt 0
+            } |
+            ForEach-Object {
+                Get-TwitchChatLine `
+                    -Item $_ `
+                    -YouTube:$YouTube
+            }
+    )
+
+    Send-TwitchChatMessages `
+        -Channel $TwitchChannel `
+        -User $TwitchUser `
+        -OAuthToken $TwitchOAuthToken `
+        -Messages $messages `
+        -DelaySeconds $TwitchMessageDelaySeconds
+}
+
 function Invoke-BreakCheck {
     $targetDay = Get-TargetDay -RequestedDay $Day
     $targetDate = Get-TargetDate -Day $targetDay
@@ -1627,6 +1910,17 @@ function Invoke-BreakCheck {
                 Title
     )
 
+    if ($Dailies) {
+        $allResults = @(
+            $allResults |
+                Where-Object {
+                    (Test-DailyBreak -Item $_) -and
+                    $null -ne $_.SpotsLeft -and
+                    $_.SpotsLeft -gt 0
+                }
+        )
+    }
+
     Show-BreakResults `
         -Results $allResults `
         -Day $targetDay `
@@ -1638,6 +1932,10 @@ function Invoke-BreakCheck {
         -Day $targetDay `
         -YouTube:$YouTube `
         -IncludeDayCollectionLink:$DayWasExplicitlyRequested
+
+    Publish-TwitchResults `
+        -Results $allResults `
+        -YouTube:$YouTube
 
     return $allResults
 }

@@ -9,6 +9,8 @@ clean, ready-to-share break lines.
 - Uses Sydney time when deciding today's date.
 - Prints each break with description, sport emoji, spots left, break number,
   allocation suffix where useful, and product URL.
+- Can filter to daily breaks with spots left and send one Twitch chat message
+  per daily.
 - Can produce YouTube-friendly break lines capped at 200 characters while
   keeping spots, break number, allocation suffix, and product URL intact.
 - Prints a selected day's live openings collection link when `-Day` is used.
@@ -65,3 +67,74 @@ Create YouTube-friendly output capped at 200 characters per break line:
 
 When `-YouTube` is used, only the break description is shortened. The spots,
 sport emoji, break number, allocation suffix, and full product URL are kept.
+
+## Twitch Chat
+
+### Create a Twitch OAuth Token
+
+This script sends chat through Twitch IRC, so it needs a Twitch User Access
+Token for the account that will post the messages.
+
+Recommended method:
+
+1. Install the official Twitch CLI from
+   https://dev.twitch.tv/docs/cli.
+2. Log in with the Twitch account you want messages to come from.
+3. Generate a user token with the IRC chat scopes:
+
+```powershell
+twitch token -u -s "chat:read chat:edit"
+```
+
+The CLI opens a browser and asks you to authorize the scopes. Copy the
+`User Access Token` value it prints.
+
+Alternative method:
+
+Use any Twitch OAuth token generator that lets you choose scopes, log in as
+the Twitch account you want messages to come from, and select:
+
+```text
+chat:read
+chat:edit
+```
+
+Only use token generators you trust. The token can send chat as that Twitch
+account, so treat it like a password.
+
+Create a `.env` file beside the script:
+
+```text
+TWITCH_CHANNEL=yourchannel
+TWITCH_USER=yourusername
+TWITCH_OAUTH_TOKEN=oauth:your_token_here
+```
+
+`TWITCH_USER` can be your normal Twitch account or a separate bot account.
+The token needs Twitch chat `chat:read` and `chat:edit` scopes. Treat it like
+a password. The local `.env` file is ignored by git.
+
+Send only daily breaks with spots left to Twitch chat:
+
+```powershell
+.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Twitch
+```
+
+The script sends one chat message per matching daily and waits 2 seconds
+between messages by default. You can change that delay:
+
+```powershell
+.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Twitch -TwitchMessageDelaySeconds 3
+```
+
+You can also pass Twitch settings directly if needed:
+
+```powershell
+.\Watch-CherryBreaks-FullDescription.ps1 `
+  -Day Monday `
+  -Dailies `
+  -Twitch `
+  -TwitchChannel yourchannel `
+  -TwitchUser yourusername `
+  -TwitchOAuthToken $env:TWITCH_OAUTH_TOKEN
+```
