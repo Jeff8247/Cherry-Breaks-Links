@@ -9,8 +9,14 @@ clean, ready-to-share break lines.
 - Uses Sydney time when deciding today's date.
 - Prints each break with description, sport emoji, spots left, break number,
   allocation suffix where useful, and product URL.
-- Can filter to daily breaks with spots left and send one Twitch chat message
-  per daily.
+- Groups recognised recurring breaks into `Dailies`, `Weeklies`, and
+  `Other Breaks`.
+- Can filter to daily and/or weekly breaks with spots left and send one Twitch
+  chat message per matching break.
+- Recognises weekly breaks named like `Machos`, `Spenda`, `Punterz`,
+  `Sluggerz`, and `Amigos`, including loose singular/plural variants.
+- When `-Weeklies` is used, weekly breaks are searched from the broader
+  group-break listings instead of only the selected weekday.
 - Can produce YouTube-friendly break lines capped at 200 characters while
   keeping spots, break number, allocation suffix, and product URL intact.
 - Prints a selected day's live openings collection link when `-Day` is used.
@@ -120,11 +126,26 @@ Send only daily breaks with spots left to Twitch chat:
 .\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Twitch
 ```
 
-The script sends one chat message per matching daily and waits 2 seconds
+Send daily and weekly breaks with spots left to Twitch chat:
+
+```powershell
+.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Weeklies -Twitch
+```
+
+Send only weekly breaks with spots left to Twitch chat:
+
+```powershell
+.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Weeklies -Twitch
+```
+
+If `-Twitch` is used without `-Dailies` or `-Weeklies`, Twitch posting keeps
+the legacy daily-only behavior.
+
+The script sends one chat message per matching break and waits 2 seconds
 between messages by default. You can change that delay:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Twitch -TwitchMessageDelaySeconds 3
+.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Weeklies -Twitch -TwitchMessageDelaySeconds 3
 ```
 
 You can also pass Twitch settings directly if needed:
@@ -133,6 +154,7 @@ You can also pass Twitch settings directly if needed:
 .\Watch-CherryBreaks-FullDescription.ps1 `
   -Day Monday `
   -Dailies `
+  -Weeklies `
   -Twitch `
   -TwitchChannel yourchannel `
   -TwitchUser yourusername `

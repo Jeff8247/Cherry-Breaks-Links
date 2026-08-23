@@ -16,6 +16,7 @@ Examples:
 .\Watch-CherryBreaks-PowerShell51.ps1 -Day Friday -OutputPath cherry-break-results.txt
 .\Watch-CherryBreaks-PowerShell51.ps1 -Day Friday -YouTube
 .\Watch-CherryBreaks-PowerShell51.ps1 -Day Friday -Dailies -Twitch
+.\Watch-CherryBreaks-PowerShell51.ps1 -Day Friday -Dailies -Weeklies -Twitch
 
 -OutputPath overwrites the text file every run.
 #>
@@ -38,6 +39,8 @@ param(
     [switch]$YouTube,
 
     [switch]$Dailies,
+
+    [switch]$Weeklies,
 
     [switch]$Twitch,
 
@@ -1123,11 +1126,46 @@ function Get-DailyBreakName {
     return $name
 }
 
+function Get-WeeklyBreakName {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Title
+    )
+
+    # Weekly break names are sometimes written loosely. Recognise common
+    # singular/plural and z/s variants.
+    $weeklyNameMatch = [regex]::Match(
+        $Title,
+        '(?i)\b(?<name>Machos?|Spenda(?:s|z)?|Punterz?|Slugger(?:s|z)?|Amigos?)\b'
+    )
+
+    if (-not $weeklyNameMatch.Success) {
+        return $null
+    }
+
+    $rawName = $weeklyNameMatch.Groups['name'].Value.ToLowerInvariant()
+
+    $name = switch -Regex ($rawName) {
+        '^macho'   { 'Machos' }
+        '^spenda'  { 'Spenda' }
+        '^punter'  { 'Punterz' }
+        '^slugger' { 'Sluggerz' }
+        '^amigo'   { 'Amigos' }
+    }
+
+    return $name
+}
+
 function Get-FullBreakDescription {
     param(
         [Parameter(Mandatory)]
         [string]$Title
     )
+
+    $weeklyBreakName = Get-WeeklyBreakName -Title $Title
+    if ($weeklyBreakName) {
+        return $weeklyBreakName
+    }
 
     # The five recurring daily breaks use their established short names.
     $dailyBreakName = Get-DailyBreakName -Title $Title
@@ -1184,6 +1222,70 @@ function Test-DailyBreak {
     )
 
     return $null -ne (Get-DailyBreakName -Title $Item.Title)
+}
+
+function Test-WeeklyBreak {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Item
+    )
+
+    return $null -ne (Get-WeeklyBreakName -Title $Item.Title)
+}
+
+function Test-DailyResultBreak {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Item
+    )
+
+    return (Test-DailyBreak -Item $Item) -and
+        -not (Test-WeeklyBreak -Item $Item)
+}
+
+function Test-OpenRecurringBreak {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Item
+    )
+
+    return $null -ne $Item.SpotsLeft -and
+        $Item.SpotsLeft -gt 0
+}
+
+function Get-SelectedRecurringBreaks {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Results,
+
+        [switch]$IncludeDailies,
+
+        [switch]$IncludeWeeklies
+    )
+
+    $selectedResults = New-Object `
+        -TypeName 'System.Collections.Generic.List[object]'
+
+    if ($IncludeDailies) {
+        foreach ($item in @($Results | Where-Object {
+                    (Test-DailyResultBreak -Item $_) -and
+                    (Test-OpenRecurringBreak -Item $_)
+                })) {
+            [void]$selectedResults.Add($item)
+        }
+    }
+
+    if ($IncludeWeeklies) {
+        foreach ($item in @($Results | Where-Object {
+                    (Test-WeeklyBreak -Item $_) -and
+                    (Test-OpenRecurringBreak -Item $_)
+                })) {
+            [void]$selectedResults.Add($item)
+        }
+    }
+
+    return $selectedResults.ToArray()
 }
 
 function Get-BreakSportEmoji {
@@ -1347,10 +1449,11 @@ function Format-BreakLine {
     $description = Get-FullBreakDescription -Title $Item.Title
     $sportEmoji = Get-BreakSportEmoji -Title $Item.Title
 
-    $isDailyBreak = Test-DailyBreak -Item $Item
+    $isNamedRecurringBreak = (Test-DailyBreak -Item $Item) -or
+        (Test-WeeklyBreak -Item $Item)
 
     $spotsText = if ($null -eq $Item.SpotsLeft) {
-        if ($isDailyBreak) {
+        if ($isNamedRecurringBreak) {
             '(? spots left)'
         }
         else {
@@ -1358,7 +1461,7 @@ function Format-BreakLine {
         }
     }
     else {
-        if ($isDailyBreak) {
+        if ($isNamedRecurringBreak) {
             "($($Item.SpotsLeft) spots left)"
         }
         else {
@@ -1439,17 +1542,26 @@ function Get-BreakResultGroups {
 
     $dailyResults = @(
         $Results |
-            Where-Object { Test-DailyBreak -Item $_ }
+            Where-Object { Test-DailyResultBreak -Item $_ }
+    )
+
+    $weeklyResults = @(
+        $Results |
+            Where-Object { Test-WeeklyBreak -Item $_ }
     )
 
     $otherResults = @(
         $Results |
-            Where-Object { -not (Test-DailyBreak -Item $_) }
+            Where-Object {
+                -not (Test-DailyBreak -Item $_) -and
+                -not (Test-WeeklyBreak -Item $_)
+            }
     )
 
     return [pscustomobject]@{
-        Dailies = $dailyResults
-        Other   = $otherResults
+        Dailies  = $dailyResults
+        Weeklies = $weeklyResults
+        Other    = $otherResults
     }
 }
 
@@ -1517,6 +1629,20 @@ function Show-BreakResults {
         Write-Host 'Dailies' -ForegroundColor Cyan
 
         foreach ($item in $groups.Dailies) {
+            Write-BreakResultLine `
+                -Item $item `
+                -YouTube:$YouTube
+        }
+
+        if ($groups.Weeklies -or $groups.Other) {
+            Write-Host ''
+        }
+    }
+
+    if ($groups.Weeklies) {
+        Write-Host 'Weeklies' -ForegroundColor Cyan
+
+        foreach ($item in $groups.Weeklies) {
             Write-BreakResultLine `
                 -Item $item `
                 -YouTube:$YouTube
@@ -1594,6 +1720,22 @@ function Save-TextResults {
             $lines.Add('Dailies')
 
             foreach ($item in $groups.Dailies) {
+                $lines.Add(
+                    (Format-BreakLine `
+                        -Item $item `
+                        -YouTube:$YouTube)
+                )
+            }
+
+            if ($groups.Weeklies -or $groups.Other) {
+                $lines.Add('')
+            }
+        }
+
+        if ($groups.Weeklies) {
+            $lines.Add('Weeklies')
+
+            foreach ($item in $groups.Weeklies) {
                 $lines.Add(
                     (Format-BreakLine `
                         -Item $item `
@@ -1767,13 +1909,12 @@ function Publish-TwitchResults {
         )
     }
 
+    $includeDailies = $Dailies -or -not $Weeklies
     $messages = @(
-        $Results |
-            Where-Object {
-                (Test-DailyBreak -Item $_) -and
-                $null -ne $_.SpotsLeft -and
-                $_.SpotsLeft -gt 0
-            } |
+        Get-SelectedRecurringBreaks `
+            -Results $Results `
+            -IncludeDailies:$includeDailies `
+            -IncludeWeeklies:$Weeklies |
             ForEach-Object {
                 Get-TwitchChatLine `
                     -Item $_ `
@@ -1792,47 +1933,50 @@ function Publish-TwitchResults {
 function Invoke-BreakCheck {
     $targetDay = Get-TargetDay -RequestedDay $Day
     $targetDate = Get-TargetDate -Day $targetDay
+    $isWeeklyOnlySearch = $Weeklies -and -not $Dailies
 
     $results = New-Object `
         -TypeName 'System.Collections.Generic.List[object]'
 
-    $collectionUrl = Get-CollectionUrl `
-        -Day $targetDay
-
     Write-Host ''
     Write-Host 'Checking all breaks...' -ForegroundColor Cyan
 
-    Write-Verbose "Collection URL: $collectionUrl"
-
     try {
-        $productLinks = @(
-            Get-ProductLinks `
-                -CollectionUrl $collectionUrl
-        )
-
         $productLinkSet = New-Object `
             -TypeName 'System.Collections.Generic.HashSet[string]' `
             -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
 
-        foreach ($productUrl in $productLinks) {
-            [void]$productLinkSet.Add($productUrl)
-        }
+        if (-not $isWeeklyOnlySearch) {
+            $collectionUrl = Get-CollectionUrl `
+                -Day $targetDay
 
-        $dayProductsCollectionUrl = Get-DayProductsCollectionUrl `
-            -Day $targetDay
+            Write-Verbose "Collection URL: $collectionUrl"
 
-        Write-Verbose (
-            "Checking day collection for live openings matching " +
-            "$targetDay`: $dayProductsCollectionUrl"
-        )
+            $productLinks = @(
+                Get-ProductLinks `
+                    -CollectionUrl $collectionUrl
+            )
 
-        $dayProductLinks = @(
-            Get-ProductLinks `
-                -CollectionUrl $dayProductsCollectionUrl
-        )
+            foreach ($productUrl in $productLinks) {
+                [void]$productLinkSet.Add($productUrl)
+            }
 
-        foreach ($productUrl in $dayProductLinks) {
-            [void]$productLinkSet.Add($productUrl)
+            $dayProductsCollectionUrl = Get-DayProductsCollectionUrl `
+                -Day $targetDay
+
+            Write-Verbose (
+                "Checking day collection for live openings matching " +
+                "$targetDay`: $dayProductsCollectionUrl"
+            )
+
+            $dayProductLinks = @(
+                Get-ProductLinks `
+                    -CollectionUrl $dayProductsCollectionUrl
+            )
+
+            foreach ($productUrl in $dayProductLinks) {
+                [void]$productLinkSet.Add($productUrl)
+            }
         }
 
         $fallbackCollectionUrl = Get-UnfilteredCollectionUrl
@@ -1847,10 +1991,11 @@ function Invoke-BreakCheck {
         )
 
         foreach ($productUrl in $fallbackProductLinks) {
-            if (Test-ProductMatchesDayFallback `
+            if ($Weeklies -or
+                (Test-ProductMatchesDayFallback `
                     -ProductUrl $productUrl `
                     -Day $targetDay `
-                    -TargetDate $targetDate) {
+                    -TargetDate $targetDate)) {
                 [void]$productLinkSet.Add($productUrl)
             }
         }
@@ -1865,9 +2010,13 @@ function Invoke-BreakCheck {
             $break = Get-CherryBreak `
                 -ProductUrl $productUrl
 
+            $isWeeklySearchMatch = $Weeklies -and
+                (Test-WeeklyBreak -Item $break)
             $titleDate = Get-TextBreakDate -Text $break.Title
 
-            if ($titleDate -and $titleDate -ne $targetDate.Date) {
+            if (-not $isWeeklySearchMatch -and
+                $titleDate -and
+                $titleDate -ne $targetDate.Date) {
                 Write-Verbose (
                     "Skipping '$($break.Title)' because its title date " +
                     "$($titleDate.ToString('dd MMM yyyy')) does not match " +
@@ -1877,7 +2026,7 @@ function Invoke-BreakCheck {
                 continue
             }
 
-            if (-not $titleDate) {
+            if (-not $isWeeklySearchMatch -and -not $titleDate) {
                 $uri = [uri]$productUrl
                 $urlDate = Get-TextBreakDate -Text $uri.AbsolutePath
 
@@ -1910,14 +2059,12 @@ function Invoke-BreakCheck {
                 Title
     )
 
-    if ($Dailies) {
+    if ($Dailies -or $Weeklies) {
         $allResults = @(
-            $allResults |
-                Where-Object {
-                    (Test-DailyBreak -Item $_) -and
-                    $null -ne $_.SpotsLeft -and
-                    $_.SpotsLeft -gt 0
-                }
+            Get-SelectedRecurringBreaks `
+                -Results $allResults `
+                -IncludeDailies:$Dailies `
+                -IncludeWeeklies:$Weeklies
         )
     }
 
