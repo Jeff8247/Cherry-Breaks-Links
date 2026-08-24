@@ -169,6 +169,14 @@ between messages by default. You can change that delay:
 .\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Weeklies -Twitch -TwitchMessageDelaySeconds 3
 ```
 
+The Twitch sender prints whether Twitch IRC accepted the login and confirmed
+the channel join before submitting messages. For raw IRC diagnostics, rerun
+with `-Verbose`; the OAuth token is redacted in verbose output:
+
+```powershell
+.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Twitch -Verbose
+```
+
 You can also pass Twitch settings directly if needed:
 
 ```powershell

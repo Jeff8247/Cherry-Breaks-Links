@@ -1794,6 +1794,134 @@ function Get-TwitchChatLine {
         -YouTube:$YouTube
 }
 
+function Get-RedactedTwitchIrcLine {
+    param(
+        [AllowNull()]
+        [string]$Line
+    )
+
+    if ($null -eq $Line) {
+        return $null
+    }
+
+    if ($Line -match '^PASS\s+') {
+        return 'PASS [redacted]'
+    }
+
+    return $Line
+}
+
+function Read-TwitchIrcLines {
+    param(
+        [Parameter(Mandatory)]
+        [System.IO.StreamReader]$Reader,
+
+        [ValidateRange(100, 30000)]
+        [int]$TimeoutMilliseconds = 1000
+    )
+
+    $lines = New-Object `
+        -TypeName 'System.Collections.Generic.List[string]'
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $remainingMilliseconds = [int][Math]::Max(
+            100,
+            ($deadline - [DateTime]::UtcNow).TotalMilliseconds
+        )
+
+        try {
+            $Reader.BaseStream.ReadTimeout = [Math]::Min(
+                1000,
+                $remainingMilliseconds
+            )
+
+            $line = $Reader.ReadLine()
+
+            if ($null -eq $line) {
+                break
+            }
+
+            $lines.Add($line)
+            Write-Verbose "Twitch IRC <- $(Get-RedactedTwitchIrcLine -Line $line)"
+        }
+        catch [System.IO.IOException] {
+            break
+        }
+    }
+
+    return @($lines)
+}
+
+function Test-TwitchIrcLoginAccepted {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Lines
+    )
+
+    return [bool](
+        $Lines |
+            Where-Object {
+                $_ -match '(^| )001 ' -or
+                $_ -match '^:tmi\.twitch\.tv 001 '
+            } |
+            Select-Object -First 1
+    )
+}
+
+function Get-TwitchIrcFailureLine {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Lines
+    )
+
+    return $Lines |
+        Where-Object {
+            $_ -match 'Login authentication failed' -or
+            $_ -match 'Improperly formatted auth' -or
+            $_ -match 'Error logging in' -or
+            $_ -match '^:tmi\.twitch\.tv NOTICE \* :'
+        } |
+        Select-Object -First 1
+}
+
+function Test-TwitchIrcJoinAccepted {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Lines,
+
+        [Parameter(Mandatory)]
+        [string]$Channel
+    )
+
+    return [bool](
+        $Lines |
+            Where-Object {
+                $_ -match " JOIN #$([regex]::Escape($Channel))$" -or
+                $_ -match " ROOMSTATE #$([regex]::Escape($Channel))$" -or
+                $_ -match " 353 .* #$([regex]::Escape($Channel)) :"
+            } |
+            Select-Object -First 1
+    )
+}
+
+function Get-TwitchIrcNoticeLines {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Lines
+    )
+
+    return @(
+        $Lines |
+            Where-Object { $_ -match ' NOTICE ' }
+    )
+}
+
 function Send-TwitchChatMessages {
     param(
         [Parameter(Mandatory)]
@@ -1828,9 +1956,11 @@ function Send-TwitchChatMessages {
 
     $tcpClient = New-Object System.Net.Sockets.TcpClient
     $sslStream = $null
+    $reader = $null
     $writer = $null
 
     try {
+        Write-Host "Connecting to Twitch IRC as $cleanUser for #$cleanChannel..." -ForegroundColor Cyan
         $tcpClient.Connect('irc.chat.twitch.tv', 6697)
 
         $sslStream = New-Object `
@@ -1842,29 +1972,103 @@ function Send-TwitchChatMessages {
 
         $sslStream.AuthenticateAsClient('irc.chat.twitch.tv')
 
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+        $reader = New-Object `
+            System.IO.StreamReader(
+                $sslStream,
+                $utf8NoBom
+            )
+
         $writer = New-Object `
             System.IO.StreamWriter(
                 $sslStream,
-                [System.Text.Encoding]::UTF8
+                $utf8NoBom
             )
         $writer.NewLine = "`r`n"
         $writer.AutoFlush = $true
 
+        Write-Verbose 'Twitch IRC -> CAP REQ :twitch.tv/commands twitch.tv/membership'
+        $writer.WriteLine('CAP REQ :twitch.tv/commands twitch.tv/membership')
+        Write-Verbose 'Twitch IRC -> PASS [redacted]'
         $writer.WriteLine("PASS $cleanToken")
+        Write-Verbose "Twitch IRC -> NICK $cleanUser"
         $writer.WriteLine("NICK $cleanUser")
+
+        $loginLines = Read-TwitchIrcLines `
+            -Reader $reader `
+            -TimeoutMilliseconds 5000
+
+        $failureLine = Get-TwitchIrcFailureLine -Lines $loginLines
+
+        if ($failureLine) {
+            throw "Twitch IRC login failed: $(Get-RedactedTwitchIrcLine -Line $failureLine)"
+        }
+
+        if (Test-TwitchIrcLoginAccepted -Lines $loginLines) {
+            Write-Host 'Twitch IRC login accepted.' -ForegroundColor Green
+        }
+        else {
+            Write-Warning (
+                'Twitch IRC did not send a login confirmation before the timeout. ' +
+                'Messages will still be attempted; rerun with -Verbose to inspect server lines.'
+            )
+        }
+
+        Write-Verbose "Twitch IRC -> JOIN #$cleanChannel"
         $writer.WriteLine("JOIN #$cleanChannel")
 
-        Start-Sleep -Seconds 2
+        $joinLines = Read-TwitchIrcLines `
+            -Reader $reader `
+            -TimeoutMilliseconds 5000
+
+        $joinFailureLine = Get-TwitchIrcFailureLine -Lines $joinLines
+
+        if ($joinFailureLine) {
+            throw "Twitch IRC join failed: $(Get-RedactedTwitchIrcLine -Line $joinFailureLine)"
+        }
+
+        if (Test-TwitchIrcJoinAccepted -Lines $joinLines -Channel $cleanChannel) {
+            Write-Host "Twitch IRC joined #$cleanChannel." -ForegroundColor Green
+        }
+        else {
+            Write-Warning (
+                "Twitch IRC did not confirm joining #$cleanChannel before the timeout. " +
+                'Messages will still be attempted; rerun with -Verbose to inspect server lines.'
+            )
+        }
 
         foreach ($message in $Messages) {
+            Write-Verbose "Twitch IRC -> PRIVMSG #$cleanChannel :$message"
             $writer.WriteLine("PRIVMSG #$cleanChannel :$message")
-            Write-Host "Sent Twitch chat message: $message" -ForegroundColor Green
+
+            $messageResponseLines = Read-TwitchIrcLines `
+                -Reader $reader `
+                -TimeoutMilliseconds 1000
+
+            $noticeLines = Get-TwitchIrcNoticeLines -Lines $messageResponseLines
+
+            if ($noticeLines) {
+                foreach ($noticeLine in $noticeLines) {
+                    Write-Warning (
+                        "Twitch IRC notice after message: $(Get-RedactedTwitchIrcLine -Line $noticeLine)"
+                    )
+                }
+            }
+            else {
+                Write-Host "Submitted Twitch chat message: $message" -ForegroundColor Green
+            }
+
             Start-Sleep -Seconds $DelaySeconds
         }
     }
     finally {
         if ($null -ne $writer) {
             $writer.Dispose()
+        }
+
+        if ($null -ne $reader) {
+            $reader.Dispose()
         }
 
         if ($null -ne $sslStream) {
