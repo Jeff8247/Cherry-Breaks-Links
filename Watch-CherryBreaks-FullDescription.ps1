@@ -52,7 +52,7 @@ param(
     [string]$TwitchOAuthToken,
 
     [ValidateRange(1, 30)]
-    [int]$TwitchMessageDelaySeconds = 2,
+    [int]$TwitchMessageDelaySeconds = 3,
 
     [string]$EnvPath = '.env'
 )
