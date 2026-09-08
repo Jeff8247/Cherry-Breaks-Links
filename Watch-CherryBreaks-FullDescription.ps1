@@ -1194,6 +1194,8 @@ function Get-FullBreakDescription {
     $description = $description -replace '(?i)\b(?:Random\s+Characters?)\b', ' '
     $description = $description -replace '(?i)\b(?:Random\s+Wreslet)\b', ' '
     $description = $description -replace '(?i)\bOpening\b', ' '
+    # A single box is the default, so only display a count for multi-box breaks.
+    $description = $description -replace '(?i)\b1\s*-?\s*Box(?:es)?\b', ' '
     $description = $description -replace '(?i)\b(?<count>\d+)\s*-?\s*Box(?:es)?\b', '(${count})'
 
     # Clean separators and whitespace left behind by removed metadata.
