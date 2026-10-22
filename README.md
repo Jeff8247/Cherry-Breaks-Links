@@ -41,8 +41,10 @@ and produce the same output, and both read the same `.env` file.
   one request at a time.
 - `Watch-CherryBreaks-FullDescription-v2.ps1` - faster. Before checking
   products, it loads all product data at once with a single
-  `curl.exe --parallel` call (6 at a time). Typical runs dropped from about
-  22-28 seconds to about 9 seconds in testing.
+  `curl.exe --parallel` call (6 at a time). It also turns off the slow
+  PowerShell progress bar and reuses the collection page between listings.
+  Typical runs dropped from about 22-28 seconds to about 5-8 seconds in
+  testing on Windows PowerShell 5.1.
 
 v2 notes:
 

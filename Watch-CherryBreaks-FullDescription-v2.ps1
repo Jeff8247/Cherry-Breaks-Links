@@ -59,6 +59,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# The progress bar makes Invoke-WebRequest much slower in Windows PowerShell 5.1.
+$ProgressPreference = 'SilentlyContinue'
 $DayWasExplicitlyRequested = $PSBoundParameters.ContainsKey('Day')
 
 [Net.ServicePointManager]::SecurityProtocol = `
@@ -74,6 +76,7 @@ $Headers = @{
 }
 
 $ProductJsonCache = @{}
+$CollectionHtmlCache = @{}
 
 function Resolve-ScriptRelativePath {
     param(
@@ -965,11 +968,21 @@ function Get-ProductLinks {
         -TypeName 'System.Collections.Generic.HashSet[string]' `
         -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
 
+    # The filtered and unfiltered listings of one collection share the same
+    # page, which is only used to find the Fast Simon grid URL.
+    $collectionPath = ([uri]$CollectionUrl).AbsolutePath
+
     try {
-        $response = Invoke-CherryRequest `
-            -Uri $CollectionUrl `
-            -MaximumAttempts 1
-        $html = $response.Content
+        if ($CollectionHtmlCache.ContainsKey($collectionPath)) {
+            Write-Verbose "Reusing collection page for $collectionPath"
+            $html = $CollectionHtmlCache[$collectionPath]
+        }
+        else {
+            $response = Invoke-CherryRequest `
+                -Uri $CollectionUrl `
+                -MaximumAttempts 1
+            $html = $response.Content
+        }
     }
     catch {
         Write-Warning (
@@ -988,6 +1001,10 @@ function Get-ProductLinks {
     $fastSimonGridUrl = Get-FastSimonGridUrl `
         -Html $html `
         -CollectionUrl $CollectionUrl
+
+    if ($fastSimonGridUrl) {
+        $CollectionHtmlCache[$collectionPath] = $html
+    }
 
     # Match rendered product-card links. The base collection HTML can contain
     # unrelated fallback/product JSON, so prefer the Fast Simon grid HTML above.
