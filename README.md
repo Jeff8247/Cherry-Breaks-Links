@@ -32,10 +32,37 @@ Topps Chrome Delight Baseball ⚾ (9 spots) #32911 -> https://www.cherrycollecta
 Immaculate Baseball ⚾ (28 spots) #32929 - RT -> https://www.cherrycollectables.com.au/products/...
 ```
 
+## Versions
+
+Two copies of the script are kept side by side. They take the same parameters
+and produce the same output, and both read the same `.env` file.
+
+- `Watch-CherryBreaks-FullDescription.ps1` - the original. Loads each product
+  one request at a time.
+- `Watch-CherryBreaks-FullDescription-v2.ps1` - faster. Before checking
+  products, it loads all product data at once with a single
+  `curl.exe --parallel` call (6 at a time). Typical runs dropped from about
+  22-28 seconds to about 9 seconds in testing.
+
+v2 notes:
+
+- It needs `curl.exe` 7.66 or newer (`curl.exe --version`), which current
+  Windows 10 and 11 include. If curl is missing or too old, v2 quietly falls
+  back to loading products one at a time, the same as the original.
+- It uses curl rather than PowerShell's own web requests because the site
+  rate limits (HTTP 429) bursts of PowerShell requests but not curl.
+- Run with `-Verbose` to see how many products were prefetched, for example
+  `Prefetched 44 of 44 product JSON file(s)`.
+- Use the original script if v2 ever misbehaves.
+
+Every example below works with either script; swap in the `-v2` filename to
+use the faster one.
+
 ## Requirements
 
 - Windows PowerShell 5.1 or PowerShell 7+
 - Internet access to `cherrycollectables.com.au`
+- v2 only: `curl.exe` 7.66 or newer (included with current Windows 10/11)
 
 ## Usage
 
