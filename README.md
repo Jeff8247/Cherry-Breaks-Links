@@ -51,10 +51,10 @@ Check a specific weekday:
 .\Watch-CherryBreaks-FullDescription.ps1 -Day Monday
 ```
 
-The selected weekday output includes that day's live openings collection link:
+The selected weekday output includes a site search link for that day's live openings, using the next date that falls on that weekday (Sydney time):
 
 ```text
-Tonights Live Openings (Plz Check Dates) -> https://www.cherrycollectables.com.au/collections/Monday
+Tonights Live Openings (Plz Check Dates) -> https://www.cherrycollectables.com.au/pages/search-results?q=Oct+26+Opening
 ```
 
 Save results to a text file:

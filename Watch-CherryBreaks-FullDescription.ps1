@@ -1366,6 +1366,23 @@ function Get-DayProductsCollectionUrl {
     return "$(Get-DayCollectionUrl -Day $Day)?sort=creation_date"
 }
 
+function Get-DayOpeningsSearchUrl {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Day
+    )
+
+    # Most weekday collections are empty, so search by the date that
+    # product titles use instead, e.g. "Oct 22 Opening".
+    $dateText = (Get-TargetDate -Day $Day).ToString(
+        'MMM d',
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+    $query = [uri]::EscapeDataString("$dateText Opening") -replace '%20', '+'
+
+    return "$BaseUrl/pages/search-results?q=$query"
+}
+
 function Get-DayCollectionLine {
     param(
         [Parameter(Mandatory)]
@@ -1373,7 +1390,7 @@ function Get-DayCollectionLine {
     )
 
     return 'Tonights Live Openings (Plz Check Dates) -> {0}' -f `
-        (Get-DayCollectionUrl -Day $Day)
+        (Get-DayOpeningsSearchUrl -Day $Day)
 }
 
 function Normalize-BreakLine {
