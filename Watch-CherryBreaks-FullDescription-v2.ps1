@@ -387,6 +387,20 @@ function Invoke-CherryRequest {
                 -UseBasicParsing
         }
         catch {
+            $response = $_.Exception.Response
+
+            if ($response -and [int]$response.StatusCode -eq 429) {
+                # Retrying or falling back to curl only sends more requests
+                # into the limit, so stop and report how long to wait.
+                $retryAfter = $null
+
+                try { $retryAfter = $response.Headers.RetryAfter.Delta.TotalSeconds } catch { }
+
+                $wait = if ($retryAfter) { " Retry after $([int]$retryAfter) seconds." } else { '' }
+
+                throw "Rate limited (HTTP 429) by '$Uri'.$wait"
+            }
+
             if ($attempt -eq $MaximumAttempts) {
                 Write-Verbose (
                     "PowerShell request failed for '$Uri'. " +
@@ -586,7 +600,7 @@ function Read-ProductJsonIntoCache {
         [string[]]$ProductUrls,
 
         [ValidateRange(1, 16)]
-        [int]$ThrottleLimit = 6
+        [int]$ThrottleLimit = 3
     )
 
     # Product JSON requests are independent, so fetch them concurrently with
@@ -985,6 +999,10 @@ function Get-ProductLinks {
         }
     }
     catch {
+        if ($_.Exception.Message -like 'Rate limited*') {
+            throw
+        }
+
         Write-Warning (
             "Collection HTML request failed for '$CollectionUrl'. " +
             "Trying Shopify products JSON fallback. " +
