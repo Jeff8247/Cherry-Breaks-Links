@@ -34,31 +34,33 @@ Immaculate Baseball ⚾ (28 spots) #32929 - RT -> https://www.cherrycollectables
 
 ## Versions
 
-Two copies of the script are kept side by side. They take the same parameters
-and produce the same output, and both read the same `.env` file.
+Three copies of the script are kept side by side. They take the same parameters
+and produce the same output, and all read the same `.env` file.
 
 - `Watch-CherryBreaks-FullDescription.ps1` - the original. Loads each product
   one request at a time.
 - `Watch-CherryBreaks-FullDescription-v2.ps1` - faster. Before checking
   products, it loads all product data at once with a single
-  `curl.exe --parallel` call (6 at a time). It also turns off the slow
+  `curl.exe --parallel` call. It also turns off the slow
   PowerShell progress bar and reuses the collection page between listings.
-  Typical runs dropped from about 22-28 seconds to about 5-8 seconds in
-  testing on Windows PowerShell 5.1.
+- `Watch-CherryBreaks-FullDescription-v3.ps1` - rate-limit resilient.
+  Features robust cross-version HTTP 429 rate-limiting detection for both
+  Windows PowerShell 5.1 (.NET Framework) and PowerShell 7+ (.NET Core),
+  native curl HTTP 429 and 403 status detection (preventing masked exit code
+  22 errors), and immediate clean halts that prevent cascading fallback loops
+  from hammering the Shopify edge.
 
-v2 notes:
+v2 & v3 notes:
 
-- It needs `curl.exe` 7.66 or newer (`curl.exe --version`), which current
-  Windows 10 and 11 include. If curl is missing or too old, v2 quietly falls
+- They need `curl.exe` 7.66 or newer (`curl.exe --version`), which current
+  Windows 10 and 11 include. If curl is missing or too old, they quietly fall
   back to loading products one at a time, the same as the original.
-- It uses curl rather than PowerShell's own web requests because the site
-  rate limits (HTTP 429) bursts of PowerShell requests but not curl.
-- Run with `-Verbose` to see how many products were prefetched, for example
-  `Prefetched 44 of 44 product JSON file(s)`.
-- Use the original script if v2 ever misbehaves.
+- Run with `-Verbose` to see diagnostic information such as prefetch count.
+- If rate-limited (HTTP 429) by Shopify, v3 halts immediately and advises how
+  long to pause so the rolling IP block can reset.
 
-Every example below works with either script; swap in the `-v2` filename to
-use the faster one.
+Every example below works with any script; swap in the `-v3` filename to
+use the rate-limit resilient version.
 
 ## Requirements
 
