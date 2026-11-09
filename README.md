@@ -32,54 +32,40 @@ Topps Chrome Delight Baseball ⚾ (9 spots) #32911 -> https://www.cherrycollecta
 Immaculate Baseball ⚾ (28 spots) #32929 - RT -> https://www.cherrycollectables.com.au/products/...
 ```
 
-## Versions
+## Script
 
-Three copies of the script are kept side by side. They take the same parameters
-and produce the same output, and all read the same `.env` file.
+`Watch-CherryBreaks-FullDescription-v3.ps1` is the only script. Before checking
+products, it loads all product data at once with a single `curl.exe --parallel`
+call. It also turns off the slow PowerShell progress bar and reuses the
+collection page between listings.
 
-- `Watch-CherryBreaks-FullDescription.ps1` - the original. Loads each product
-  one request at a time.
-- `Watch-CherryBreaks-FullDescription-v2.ps1` - faster. Before checking
-  products, it loads all product data at once with a single
-  `curl.exe --parallel` call. It also turns off the slow
-  PowerShell progress bar and reuses the collection page between listings.
-- `Watch-CherryBreaks-FullDescription-v3.ps1` - rate-limit resilient.
-  Features robust cross-version HTTP 429 rate-limiting detection for both
-  Windows PowerShell 5.1 (.NET Framework) and PowerShell 7+ (.NET Core),
-  native curl HTTP 429 and 403 status detection (preventing masked exit code
-  22 errors), and immediate clean halts that prevent cascading fallback loops
-  from hammering the Shopify edge.
-
-v2 & v3 notes:
-
-- They need `curl.exe` 7.66 or newer (`curl.exe --version`), which current
-  Windows 10 and 11 include. If curl is missing or too old, they quietly fall
-  back to loading products one at a time, the same as the original.
+- It needs `curl.exe` 7.66 or newer (`curl.exe --version`), which current
+  Windows 10 and 11 include. If curl is missing or too old, it quietly falls
+  back to loading products one at a time.
 - Run with `-Verbose` to see diagnostic information such as prefetch count.
-- If rate-limited (HTTP 429) by Shopify, v3 halts immediately and advises how
-  long to pause so the rolling IP block can reset.
-
-Every example below works with any script; swap in the `-v3` filename to
-use the rate-limit resilient version.
+- It detects HTTP 429 (rate limited) and 403 (blocked) on both Windows
+  PowerShell 5.1 and PowerShell 7+, including via native curl. On either, it
+  halts immediately instead of cascading into more requests, and advises how
+  long to wait so the IP block can reset.
 
 ## Requirements
 
 - Windows PowerShell 5.1 or PowerShell 7+
 - Internet access to `cherrycollectables.com.au`
-- v2 only: `curl.exe` 7.66 or newer (included with current Windows 10/11)
+- Recommended: `curl.exe` 7.66 or newer (included with current Windows 10/11)
 
 ## Usage
 
 Check today's Sydney weekday:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1
+.\Watch-CherryBreaks-FullDescription-v3.ps1
 ```
 
 Check a specific weekday:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday
+.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Monday
 ```
 
 The selected weekday output includes a site search link for that day's live openings, using the next date that falls on that weekday (Sydney time):
@@ -91,7 +77,7 @@ Tonights Live Openings (Plz Check Dates) -> https://www.cherrycollectables.com.a
 Save results to a text file:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -OutputPath cherry-break-results.txt
+.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Monday -OutputPath cherry-break-results.txt
 ```
 
 `-OutputPath` overwrites the target file each run.
@@ -101,26 +87,26 @@ Save results to a text file:
 Show only daily breaks with spots left for the selected day:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies
+.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Monday -Dailies
 ```
 
 Show only weekly breaks with spots left. Weeklies are searched from the broader
 group-break listings, not only the selected day:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 -Weeklies
+.\Watch-CherryBreaks-FullDescription-v3.ps1 -Weeklies
 ```
 
 Show selected-day Dailies plus broader Weeklies:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Weeklies
+.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Monday -Dailies -Weeklies
 ```
 
 Create YouTube-friendly output capped at 200 characters per break line:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -YouTube
+.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Monday -YouTube
 ```
 
 When `-YouTube` is used, only the break description is shortened. The spots,
@@ -175,19 +161,19 @@ a password. The local `.env` file is ignored by git.
 Send only daily breaks with spots left to Twitch chat:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Twitch
+.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Monday -Dailies -Twitch
 ```
 
 Send daily and weekly breaks with spots left to Twitch chat:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Weeklies -Twitch
+.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Monday -Dailies -Weeklies -Twitch
 ```
 
 Send only weekly breaks with spots left to Twitch chat:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Weeklies -Twitch
+.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Monday -Weeklies -Twitch
 ```
 
 If `-Twitch` is used without `-Dailies` or `-Weeklies`, Twitch posting keeps
@@ -197,7 +183,7 @@ The script sends one chat message per matching break and waits 2 seconds
 between messages by default. You can change that delay:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Weeklies -Twitch -TwitchMessageDelaySeconds 3
+.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Monday -Dailies -Weeklies -Twitch -TwitchMessageDelaySeconds 3
 ```
 
 The Twitch sender prints whether Twitch IRC accepted the login and confirmed
@@ -205,13 +191,13 @@ the channel join before submitting messages. For raw IRC diagnostics, rerun
 with `-Verbose`; the OAuth token is redacted in verbose output:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 -Day Monday -Dailies -Twitch -Verbose
+.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Monday -Dailies -Twitch -Verbose
 ```
 
 You can also pass Twitch settings directly if needed:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription.ps1 `
+.\Watch-CherryBreaks-FullDescription-v3.ps1 `
   -Day Monday `
   -Dailies `
   -Weeklies `
