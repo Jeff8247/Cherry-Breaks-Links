@@ -535,6 +535,12 @@ function Invoke-CherryCurlRequest {
         throw "curl exited with code $exitCode."
     }
 
+    # --fail was dropped so the status code can be inspected; restore its
+    # behaviour by treating any other HTTP error as a failure.
+    if ($httpCode -ge 400) {
+        throw "HTTP $httpCode returned by '$Uri'."
+    }
+
     return [pscustomobject]@{
         Content    = $rawContent
         StatusCode = $httpCode
