@@ -66,7 +66,7 @@ $DayWasExplicitlyRequested = $PSBoundParameters.ContainsKey('Day')
     [Net.SecurityProtocolType]::Tls12
 
 $BaseUrl = 'https://www.cherrycollectables.com.au'
-$CollectionPath = '/collections/nba-group-breaks'
+$CollectionPath = '/collections/card-breaks'
 
 $Headers = @{
     'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
