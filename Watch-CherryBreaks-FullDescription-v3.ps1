@@ -81,6 +81,7 @@ $Headers = @{
 
 $ProductJsonCache = @{}
 $CollectionHtmlCache = @{}
+$CollectionJsonLoaded = @{}
 
 function Resolve-ScriptRelativePath {
     param(
@@ -846,7 +847,9 @@ function Get-SpotsLeftFromProductJson {
     $hasInventoryQuantities = $false
 
     foreach ($variant in $availableVariants) {
-        if ($null -ne $variant.inventory_quantity) {
+        # products.json variants may omit inventory_quantity entirely.
+        if ($variant.PSObject.Properties['inventory_quantity'] -and
+            $null -ne $variant.inventory_quantity) {
             $hasInventoryQuantities = $true
             $spots += [int]$variant.inventory_quantity
         }
@@ -1039,6 +1042,12 @@ function Add-ProductLinksFromCollectionJson {
 
             $productUrl = "$BaseUrl/products/$($product.handle)"
 
+            # products.json already carries title and variant availability,
+            # so seed the cache and skip the per-product .js request later.
+            if (-not $ProductJsonCache.ContainsKey($productUrl)) {
+                $ProductJsonCache[$productUrl] = $product
+            }
+
             if (Add-ProductUrl `
                     -ProductUrls $ProductUrls `
                     -Href $productUrl) {
@@ -1069,6 +1078,35 @@ function Get-ProductLinks {
     # The filtered and unfiltered listings of one collection share the same
     # page, which is only used to find the Fast Simon grid URL.
     $collectionPath = ([uri]$CollectionUrl).AbsolutePath
+
+    # Shopify products.json is the primary source: it is lightweight, needs
+    # no HTML parsing and returns up to 250 products (with availability) per
+    # request. It cannot apply storefront filters, so filtered URLs and any
+    # JSON failure fall through to the HTML / Fast Simon path below.
+    if (-not (Get-QueryParameter -Url $CollectionUrl -Name 'filters')) {
+        try {
+            $jsonCount = Add-ProductLinksFromCollectionJson `
+                -ProductUrls $productUrls `
+                -CollectionUrl $CollectionUrl
+
+            if ($jsonCount -gt 0) {
+                $CollectionJsonLoaded[$collectionPath] = $true
+                return @($productUrls | Sort-Object)
+            }
+        }
+        catch {
+            if ($_.Exception.Message -like 'Rate limited*' -or
+                $_.Exception.Message -like 'Access blocked*' -or
+                $_.Exception.Message -match '\b429\b|\b403\b') {
+                throw
+            }
+
+            Write-Warning (
+                "Collection products JSON failed for '$CollectionUrl'. " +
+                "Trying collection HTML. Error: $($_.Exception.Message)"
+            )
+        }
+    }
 
     try {
         if ($CollectionHtmlCache.ContainsKey($collectionPath)) {
@@ -2443,19 +2481,39 @@ function Invoke-BreakCheck {
             -TypeName 'System.Collections.Generic.HashSet[string]' `
             -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
 
+        # Load the unfiltered collection first. It uses products.json when
+        # possible, which also fills the product cache.
+        $fallbackCollectionUrl = Get-UnfilteredCollectionUrl
+        Write-Verbose (
+            "Checking unfiltered collection for URL dates matching " +
+            "$targetDay`: $fallbackCollectionUrl"
+        )
+
+        $fallbackProductLinks = @(
+            Get-ProductLinks `
+                -CollectionUrl $fallbackCollectionUrl
+        )
+
+        $unfilteredPath = ([uri]$fallbackCollectionUrl).AbsolutePath
+        $jsonCoveredCollection = $CollectionJsonLoaded.ContainsKey($unfilteredPath)
+
         if (-not $isWeeklyOnlySearch) {
-            $collectionUrl = Get-CollectionUrl `
-                -Day $targetDay
+            # The day filter only exists in the HTML storefront. When the JSON
+            # listing loaded, the date matching below replaces that request.
+            if (-not $jsonCoveredCollection) {
+                $collectionUrl = Get-CollectionUrl `
+                    -Day $targetDay
 
-            Write-Verbose "Collection URL: $collectionUrl"
+                Write-Verbose "Collection URL: $collectionUrl"
 
-            $productLinks = @(
-                Get-ProductLinks `
-                    -CollectionUrl $collectionUrl
-            )
+                $productLinks = @(
+                    Get-ProductLinks `
+                        -CollectionUrl $collectionUrl
+                )
 
-            foreach ($productUrl in $productLinks) {
-                [void]$productLinkSet.Add($productUrl)
+                foreach ($productUrl in $productLinks) {
+                    [void]$productLinkSet.Add($productUrl)
+                }
             }
 
             $dayProductsCollectionUrl = Get-DayProductsCollectionUrl `
@@ -2475,17 +2533,6 @@ function Invoke-BreakCheck {
                 [void]$productLinkSet.Add($productUrl)
             }
         }
-
-        $fallbackCollectionUrl = Get-UnfilteredCollectionUrl
-        Write-Verbose (
-            "Checking unfiltered collection for URL dates matching " +
-            "$targetDay`: $fallbackCollectionUrl"
-        )
-
-        $fallbackProductLinks = @(
-            Get-ProductLinks `
-                -CollectionUrl $fallbackCollectionUrl
-        )
 
         # Every candidate is about to be checked, so load their product JSON
         # concurrently instead of one request at a time.
