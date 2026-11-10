@@ -9,18 +9,19 @@ SPOTS LEFT | BREAK NUMBER | DESCRIPTION | URL
 By default, the script checks today's Sydney day. Use -Day to check the
 next matching weekday instead.
 
-v3 features cross-version HTTP 429 rate-limit detection for both Windows
+The Fast version loads data from Shopify products.json first, and has
+cross-version HTTP 429 rate-limit detection for both Windows
 PowerShell 5.1 and PowerShell 7+, curl exit code 22 / status inspection,
 and immediate halts to protect against cascading requests and IP cooldown bans.
 
 Examples:
 
-.\Watch-CherryBreaks-FullDescription-v3.ps1
-.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Friday
-.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Friday -OutputPath cherry-break-results.txt
-.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Friday -YouTube
-.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Friday -Dailies -Twitch
-.\Watch-CherryBreaks-FullDescription-v3.ps1 -Day Friday -Dailies -Weeklies -Twitch
+.\Watch-CherryBreaks-FullDescription-Fast.ps1
+.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Friday
+.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Friday -OutputPath cherry-break-results.txt
+.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Friday -YouTube
+.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Friday -Dailies -Twitch
+.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Friday -Dailies -Weeklies -Twitch
 
 -OutputPath overwrites the text file every run.
 #>
