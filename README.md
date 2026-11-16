@@ -34,46 +34,41 @@ Immaculate Baseball ⚾ (28 spots) #32929 - RT -> https://www.cherrycollectables
 
 ## Script
 
-`Watch-CherryBreaks-FullDescription-Fast.ps1` is the recommended script. It
+`Watch-CherryBreaks-FullDescription-PS7.ps1` is the recommended script for PowerShell 7+. It
 loads the collection from Shopify's `products.json` first (about one request per
 collection, up to 250 products each), which also supplies every product's title
-and availability, so it needs no per-product requests. It only falls back to the
-HTML collection pages and per-product requests if the JSON listing fails.
+and availability, so it needs no per-product requests. It uses native curl and
+lightweight HTTP requests to avoid Cloudflare bot detection and rate limits.
 
-The original `Watch-CherryBreaks-FullDescription.ps1` is also kept. It uses the
+The original `Watch-CherryBreaks-FullDescription.ps1` is also kept for Windows PowerShell 5.1. It uses the
 HTML collection pages and has no 429 handling.
 
 - Because `products.json` cannot apply the site's day filter, breaks are matched
   to the day by the date in their title or URL.
 - Spots left are counted from available variants. Shopify's CDN may cache the
   JSON briefly, so a spot that just sold can take a moment to show.
-- The fallback path prefetches products with `curl.exe --parallel`, which needs
-  curl 7.66 or newer (`curl.exe --version`; current Windows 10 and 11 include
-  it). If curl is missing or too old, it loads products one at a time.
 - Run with `-Verbose` to see diagnostic information such as which source was used.
-- It detects HTTP 429 (rate limited) and 403 (blocked) on both Windows
-  PowerShell 5.1 and PowerShell 7+, including via native curl. On either, it
-  halts immediately instead of cascading into more requests, and advises how
-  long to wait so the IP block can reset.
+- It detects HTTP 429 (rate limited) and 403 (blocked). It halts immediately instead
+  of cascading into more requests, and advises how long to wait so the IP block can reset.
 
 ## Requirements
 
-- Windows PowerShell 5.1 or PowerShell 7+
+- PowerShell 7.0 or later (`pwsh`)
 - Internet access to `cherrycollectables.com.au`
-- Recommended: `curl.exe` 7.66 or newer (included with current Windows 10/11)
+- Recommended: `curl.exe` / `curl` 7.66 or newer (included with Windows 10/11 and Linux)
 
 ## Usage
 
 Check today's Sydney weekday:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1
+.\Watch-CherryBreaks-FullDescription-PS7.ps1
 ```
 
 Check a specific weekday:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Monday
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday
 ```
 
 The selected weekday output includes a site search link for that day's live openings, using the next date that falls on that weekday (Sydney time):
@@ -85,7 +80,7 @@ Tonights Live Openings (Plz Check Dates) -> https://www.cherrycollectables.com.a
 Save results to a text file:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Monday -OutputPath cherry-break-results.txt
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday -OutputPath cherry-break-results.txt
 ```
 
 `-OutputPath` overwrites the target file each run.
@@ -95,26 +90,26 @@ Save results to a text file:
 Show only daily breaks with spots left for the selected day:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Monday -Dailies
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday -Dailies
 ```
 
 Show only weekly breaks with spots left. Weeklies are searched from the broader
 group-break listings, not only the selected day:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Weeklies
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Weeklies
 ```
 
 Show selected-day Dailies plus broader Weeklies:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Monday -Dailies -Weeklies
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday -Dailies -Weeklies
 ```
 
 Create YouTube-friendly output capped at 200 characters per break line:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Monday -YouTube
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday -YouTube
 ```
 
 When `-YouTube` is used, only the break description is shortened. The spots,
@@ -169,19 +164,19 @@ a password. The local `.env` file is ignored by git.
 Send only daily breaks with spots left to Twitch chat:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Monday -Dailies -Twitch
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday -Dailies -Twitch
 ```
 
 Send daily and weekly breaks with spots left to Twitch chat:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Monday -Dailies -Weeklies -Twitch
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday -Dailies -Weeklies -Twitch
 ```
 
 Send only weekly breaks with spots left to Twitch chat:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Monday -Weeklies -Twitch
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday -Weeklies -Twitch
 ```
 
 If `-Twitch` is used without `-Dailies` or `-Weeklies`, Twitch posting keeps
@@ -191,7 +186,7 @@ The script sends one chat message per matching break and waits 2 seconds
 between messages by default. You can change that delay:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Monday -Dailies -Weeklies -Twitch -TwitchMessageDelaySeconds 3
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday -Dailies -Weeklies -Twitch -TwitchMessageDelaySeconds 3
 ```
 
 The Twitch sender prints whether Twitch IRC accepted the login and confirmed
@@ -199,13 +194,13 @@ the channel join before submitting messages. For raw IRC diagnostics, rerun
 with `-Verbose`; the OAuth token is redacted in verbose output:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Monday -Dailies -Twitch -Verbose
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday -Dailies -Twitch -Verbose
 ```
 
 You can also pass Twitch settings directly if needed:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 `
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 `
   -Day Monday `
   -Dailies `
   -Weeklies `

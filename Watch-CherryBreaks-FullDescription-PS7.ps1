@@ -1,4 +1,4 @@
-#requires -Version 5.1
+#requires -Version 7.0
 
 <#
 Checks Cherry Collectables group breaks and prints full-description
@@ -9,19 +9,18 @@ SPOTS LEFT | BREAK NUMBER | DESCRIPTION | URL
 By default, the script checks today's Sydney day. Use -Day to check the
 next matching weekday instead.
 
-The Fast version loads data from Shopify products.json first, and has
-cross-version HTTP 429 rate-limit detection for both Windows
-PowerShell 5.1 and PowerShell 7+, curl exit code 22 / status inspection,
-and immediate halts to protect against cascading requests and IP cooldown bans.
+Requires PowerShell 7.0 or later. Uses Shopify products.json as the
+primary data source with native curl / lightweight HTTP requests to avoid
+Cloudflare bot detection and rate limits.
 
 Examples:
 
-.\Watch-CherryBreaks-FullDescription-Fast.ps1
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Friday
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Friday -OutputPath cherry-break-results.txt
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Friday -YouTube
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Friday -Dailies -Twitch
-.\Watch-CherryBreaks-FullDescription-Fast.ps1 -Day Friday -Dailies -Weeklies -Twitch
+.\Watch-CherryBreaks-FullDescription-PS7.ps1
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Friday
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Friday -OutputPath cherry-break-results.txt
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Friday -YouTube
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Friday -Dailies -Twitch
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Friday -Dailies -Weeklies -Twitch
 
 -OutputPath overwrites the text file every run.
 #>
@@ -64,24 +63,18 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-# The progress bar makes Invoke-WebRequest much slower in Windows PowerShell 5.1.
 $ProgressPreference = 'SilentlyContinue'
 $DayWasExplicitlyRequested = $PSBoundParameters.ContainsKey('Day')
-
-[Net.ServicePointManager]::SecurityProtocol = `
-    [Net.ServicePointManager]::SecurityProtocol -bor `
-    [Net.SecurityProtocolType]::Tls12
 
 $BaseUrl = 'https://www.cherrycollectables.com.au'
 $CollectionPath = '/collections/card-breaks'
 
 $Headers = @{
-    'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36'
-    'Accept'     = 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'
+    'User-Agent' = 'Mozilla/5.0 (compatible; CherryBreakWatcher/1.0)'
+    'Accept'     = 'application/json, */*'
 }
 
 $ProductJsonCache = @{}
-$CollectionHtmlCache = @{}
 $CollectionJsonLoaded = @{}
 
 function Resolve-ScriptRelativePath {
@@ -201,9 +194,12 @@ $TwitchOAuthToken = Get-ConfigValue `
     -Names @('TWITCH_OAUTH_TOKEN')
 
 function Get-SydneyDate {
-    $timeZone = [TimeZoneInfo]::FindSystemTimeZoneById(
-        'AUS Eastern Standard Time'
-    )
+    $timeZone = try {
+        [TimeZoneInfo]::FindSystemTimeZoneById('Australia/Sydney')
+    }
+    catch {
+        [TimeZoneInfo]::FindSystemTimeZoneById('AUS Eastern Standard Time')
+    }
 
     return [TimeZoneInfo]::ConvertTimeFromUtc(
         [datetime]::UtcNow,
@@ -238,22 +234,6 @@ function Get-TargetDate {
 
 function Get-UnfilteredCollectionUrl {
     return "$BaseUrl${CollectionPath}?sort=creation_date"
-}
-
-function Get-CollectionUrl {
-    param(
-        [string]$Day
-    )
-
-    $url = Get-UnfilteredCollectionUrl
-
-    if ($Day) {
-        $filterValue = "Day,Day_$Day"
-        $encodedFilter = [uri]::EscapeDataString($filterValue)
-        $url += "&filters=$encodedFilter"
-    }
-
-    return $url
 }
 
 function Get-TextBreakDate {
@@ -294,9 +274,7 @@ function Get-TextBreakDate {
     $year = $sydneyDate.Year
 
     try {
-        $productDate = New-Object `
-            -TypeName System.DateTime `
-            -ArgumentList $year, $month, $dayOfMonth
+        $productDate = [datetime]::new($year, $month, $dayOfMonth)
     }
     catch {
         return $null
@@ -374,100 +352,6 @@ function Test-ProductMatchesDayFallback {
     return Test-ProductUrlMatchesDay -ProductUrl $ProductUrl -Day $Day
 }
 
-function Invoke-CherryRequest {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Uri,
-
-        [ValidateRange(1, 10)]
-        [int]$MaximumAttempts = 3
-    )
-
-    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
-        try {
-            return Invoke-WebRequest `
-                -Uri $Uri `
-                -Headers $Headers `
-                -MaximumRedirection 5 `
-                -TimeoutSec 45 `
-                -UseBasicParsing
-        }
-        catch {
-            $statusCode = $null
-            $retryAfterSeconds = $null
-
-            # In Windows PowerShell 5.1, $_.Exception is WebException with .Response (HttpWebResponse)
-            if ($_.Exception.Response) {
-                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
-                try {
-                    if ($_.Exception.Response.Headers.RetryAfter -and $_.Exception.Response.Headers.RetryAfter.Delta) {
-                        $retryAfterSeconds = $_.Exception.Response.Headers.RetryAfter.Delta.TotalSeconds
-                    }
-                } catch { }
-                try {
-                    if (-not $retryAfterSeconds -and $_.Exception.Response.Headers['Retry-After']) {
-                        $retryAfterSeconds = [int]$_.Exception.Response.Headers['Retry-After']
-                    }
-                } catch { }
-            }
-
-            # In PowerShell 7 (.NET Core), $_.Exception is HttpRequestException with .StatusCode property
-            if (-not $statusCode -and $_.Exception.PSObject.Properties['StatusCode'] -and $_.Exception.StatusCode) {
-                try { $statusCode = [int]$_.Exception.StatusCode } catch { }
-            }
-
-            # Detect rate-limiting (HTTP 429) across all PowerShell versions
-            if ($statusCode -eq 429 -or ($_.Exception.Message -match '\b429\b|\bToo Many Requests\b')) {
-                $wait = if ($retryAfterSeconds) { " Retry after $([int]$retryAfterSeconds) seconds." } else { '' }
-                throw "Rate limited (HTTP 429) by '$Uri'.$wait"
-            }
-
-            if ($statusCode -eq 403 -or ($_.Exception.Message -match '\b403\b|\bForbidden\b')) {
-                Write-Verbose "PowerShell request received 403 Forbidden for '$Uri'."
-            }
-
-            if ($attempt -eq $MaximumAttempts) {
-                Write-Verbose (
-                    "PowerShell request failed for '$Uri'. " +
-                    "Trying native curl fallback. " +
-                    "Error: $($_.Exception.Message)"
-                )
-
-                try {
-                    return Invoke-CherryCurlRequest -Uri $Uri
-                }
-                catch {
-                    throw
-                }
-            }
-
-            Write-Warning (
-                "Request failed for '$Uri'. " +
-                "Retrying in $($attempt * 2) seconds. " +
-                "Error: $($_.Exception.Message)"
-            )
-
-            Start-Sleep -Seconds ($attempt * 2)
-        }
-    }
-}
-
-function Get-CollectionProductsJsonUrl {
-    param(
-        [Parameter(Mandatory)]
-        [string]$CollectionUrl
-    )
-
-    $uri = [uri]$CollectionUrl
-    $path = $uri.AbsolutePath.TrimEnd('/')
-
-    if ($path -notmatch '^/collections/[^/]+$') {
-        return $null
-    }
-
-    return "$BaseUrl$path/products.json?limit=250"
-}
-
 function Get-NativeCurlCommand {
     $commands = @(
         Get-Command curl.exe -ErrorAction SilentlyContinue
@@ -537,8 +421,7 @@ function Invoke-CherryCurlRequest {
         throw "curl exited with code $exitCode."
     }
 
-    # --fail was dropped so the status code can be inspected; restore its
-    # behaviour by treating any other HTTP error as a failure.
+    # Treat any HTTP error as a failure
     if ($httpCode -ge 400) {
         throw "HTTP $httpCode returned by '$Uri'."
     }
@@ -547,6 +430,111 @@ function Invoke-CherryCurlRequest {
         Content    = $rawContent
         StatusCode = $httpCode
     }
+}
+
+function Invoke-CherryRequest {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [ValidateRange(1, 10)]
+        [int]$MaximumAttempts = 3
+    )
+
+    $curlCommand = Get-NativeCurlCommand
+
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        try {
+            if ($curlCommand) {
+                return Invoke-CherryCurlRequest -Uri $Uri
+            }
+
+            return Invoke-WebRequest `
+                -Uri $Uri `
+                -Headers $Headers `
+                -MaximumRedirection 5 `
+                -TimeoutSec 45
+        }
+        catch {
+            $statusCode = $null
+            $retryAfterSeconds = $null
+
+            # PS7: HttpRequestException with .StatusCode property or .Response.StatusCode
+            if ($_.Exception.PSObject.Properties['StatusCode'] -and $_.Exception.StatusCode) {
+                try { $statusCode = [int]$_.Exception.StatusCode } catch { }
+            }
+            if (-not $statusCode -and $_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+            }
+
+            # Retry-After header inspection
+            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response -and $_.Exception.Response.Headers) {
+                try {
+                    if ($_.Exception.Response.Headers.RetryAfter -and $_.Exception.Response.Headers.RetryAfter.Delta) {
+                        $retryAfterSeconds = $_.Exception.Response.Headers.RetryAfter.Delta.TotalSeconds
+                    }
+                } catch { }
+                try {
+                    if (-not $retryAfterSeconds -and $_.Exception.Response.Headers.Contains('Retry-After')) {
+                        $vals = @($_.Exception.Response.Headers.GetValues('Retry-After'))
+                        if ($vals.Count -gt 0) {
+                            $retryAfterSeconds = [int]$vals[0]
+                        }
+                    }
+                } catch { }
+            }
+
+            # Detect rate-limiting (HTTP 429) across all checks
+            if ($statusCode -eq 429 -or ($_.Exception.Message -match '429|Too Many Requests')) {
+                $wait = if ($retryAfterSeconds) { " Retry after $([int]$retryAfterSeconds) seconds." } else { '' }
+                throw "Rate limited (HTTP 429) by '$Uri'.$wait"
+            }
+
+            if ($statusCode -eq 403 -or ($_.Exception.Message -match '403|Forbidden')) {
+                Write-Verbose "Request received 403 Forbidden for '$Uri'."
+            }
+
+            if (-not $curlCommand -and $attempt -eq $MaximumAttempts) {
+                $fallbackCurl = Get-NativeCurlCommand
+                if ($fallbackCurl) {
+                    Write-Verbose (
+                        "PowerShell request failed for '$Uri'. " +
+                        "Trying native curl fallback. " +
+                        "Error: $($_.Exception.Message)"
+                    )
+                    return Invoke-CherryCurlRequest -Uri $Uri
+                }
+            }
+
+            if ($attempt -eq $MaximumAttempts) {
+                throw
+            }
+
+            Write-Warning (
+                "Request failed for '$Uri'. " +
+                "Retrying in $($attempt * 2) seconds. " +
+                "Error: $($_.Exception.Message)"
+            )
+
+            Start-Sleep -Seconds ($attempt * 2)
+        }
+    }
+}
+
+function Get-CollectionProductsJsonUrl {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CollectionUrl
+    )
+
+    $uri = [uri]$CollectionUrl
+    $path = $uri.AbsolutePath.TrimEnd('/')
+
+    if ($path -notmatch '^/collections/[^/]+$') {
+        return $null
+    }
+
+    return "$BaseUrl$path/products.json?limit=250"
 }
 
 function ConvertTo-AbsoluteProductUrl {
@@ -643,7 +631,7 @@ function Get-ProductJson {
     catch {
         if ($_.Exception.Message -like 'Rate limited*' -or
             $_.Exception.Message -like 'Access blocked*' -or
-            $_.Exception.Message -match '\b429\b|\b403\b') {
+            $_.Exception.Message -match '429|403') {
             throw
         }
 
@@ -667,162 +655,10 @@ function Read-ProductJsonIntoCache {
         [int]$ThrottleLimit = 3
     )
 
-    # Product JSON requests are independent, so fetch them concurrently with
-    # a single curl --parallel call and fill $ProductJsonCache. Native curl
-    # is used because the site rate limits bursts of .NET web requests but
-    # not curl. Anything that fails is left uncached so Get-ProductJson
-    # retries it serially.
-    $requests = New-Object -TypeName 'System.Collections.Generic.List[object]'
-    $queued = New-Object `
-        -TypeName 'System.Collections.Generic.HashSet[string]' `
-        -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
-
-    foreach ($productUrl in $ProductUrls) {
-        if ($ProductJsonCache.ContainsKey($productUrl) -or
-            -not $queued.Add($productUrl)) {
-            continue
-        }
-
-        $productJsonUrl = Get-ProductJsonUrl -ProductUrl $productUrl
-
-        if ($productJsonUrl) {
-            $requests.Add(
-                [pscustomobject]@{
-                    ProductUrl     = $productUrl
-                    ProductJsonUrl = $productJsonUrl
-                    OutputPath     = $null
-                }
-            )
-        }
-    }
-
-    if ($requests.Count -lt 2) {
-        return
-    }
-
-    $curlCommand = Get-NativeCurlCommand
-
-    if (-not $curlCommand) {
-        Write-Verbose 'Native curl was not found; loading products serially.'
-        return
-    }
-
-    Write-Verbose (
-        "Prefetching $($requests.Count) product JSON file(s) with curl, " +
-        "$ThrottleLimit at a time."
-    )
-
-    $tempDirectory = Join-Path `
-        ([System.IO.Path]::GetTempPath()) `
-        "cherry-$([guid]::NewGuid().ToString('N'))"
-
-    try {
-        [void](New-Item -ItemType Directory -Path $tempDirectory)
-
-        $configLines = New-Object `
-            -TypeName 'System.Collections.Generic.List[string]'
-
-        for ($index = 0; $index -lt $requests.Count; $index++) {
-            $request = $requests[$index]
-
-            # curl config files treat backslashes as escapes, so use
-            # forward slashes, which curl also accepts on Windows.
-            $request.OutputPath = (
-                Join-Path $tempDirectory "$index.json"
-            ) -replace '\\', '/'
-
-            $configLines.Add("url = `"$($request.ProductJsonUrl)`"")
-            $configLines.Add("output = `"$($request.OutputPath)`"")
-        }
-
-        $configPath = Join-Path $tempDirectory 'curl.cfg'
-        [System.IO.File]::WriteAllLines(
-            $configPath,
-            $configLines.ToArray(),
-            (New-Object System.Text.UTF8Encoding($false))
-        )
-
-        $arguments = @(
-            '--silent',
-            '--show-error',
-            '--fail',
-            '--location',
-            '--max-time',
-            '45',
-            '--user-agent',
-            $Headers['User-Agent'],
-            '--parallel',
-            '--parallel-max',
-            "$ThrottleLimit",
-            '--config',
-            $configPath
-        )
-
-        $curlOutput = & $curlCommand.Source @arguments 2>&1
-        $curlExitCode = $LASTEXITCODE
-
-        if ($curlOutput) {
-            $curlErrorText = ($curlOutput -join ' ')
-            if ($curlErrorText -match '\b429\b|local_rate_limited') {
-                throw "Rate limited (HTTP 429) during product JSON prefetch."
-            }
-            if ($curlErrorText -match '\b403\b|Forbidden') {
-                throw "Access blocked (HTTP 403) during product JSON prefetch."
-            }
-        }
-
-        $loadedCount = 0
-
-        foreach ($request in $requests) {
-            if (-not (Test-Path -LiteralPath $request.OutputPath)) {
-                continue
-            }
-
-            try {
-                $json = [System.IO.File]::ReadAllText(
-                    $request.OutputPath,
-                    [System.Text.Encoding]::UTF8
-                )
-                $ProductJsonCache[$request.ProductUrl] = $json |
-                    ConvertFrom-Json
-                $loadedCount++
-            }
-            catch {
-                Write-Verbose (
-                    "Could not parse prefetched JSON for " +
-                    "'$($request.ProductUrl)': $($_.Exception.Message)"
-                )
-            }
-        }
-
-        if ($loadedCount -eq 0 -and $requests.Count -gt 0 -and $curlExitCode -ne 0) {
-            throw "Product JSON prefetch failed (curl exit code $curlExitCode)."
-        }
-
-        Write-Verbose (
-            "Prefetched $loadedCount of $($requests.Count) product JSON " +
-            'file(s); the rest will be loaded serially.'
-        )
-    }
-    catch {
-        if ($_.Exception.Message -like 'Rate limited*' -or
-            $_.Exception.Message -like 'Access blocked*' -or
-            $_.Exception.Message -match '\b429\b|\b403\b') {
-            throw
-        }
-
-        Write-Verbose (
-            "Product JSON prefetch failed: $($_.Exception.Message). " +
-            'Products will be loaded serially.'
-        )
-    }
-    finally {
-        Remove-Item `
-            -LiteralPath $tempDirectory `
-            -Recurse `
-            -Force `
-            -ErrorAction SilentlyContinue
-    }
+    # Product data is already populated in $ProductJsonCache when
+    # Add-ProductLinksFromCollectionJson runs (which seeds the cache from
+    # products.json). Per-product .js endpoints are aggressively rate-limited
+    # by Cloudflare and are not fetched individually.
 }
 
 function Get-SpotsLeftFromProductJson {
@@ -935,49 +771,6 @@ function Set-QueryParameter {
     return "$($parts[0])?$($parameters -join '&')"
 }
 
-function Get-FastSimonGridUrl {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Html,
-
-        [Parameter(Mandatory)]
-        [string]$CollectionUrl
-    )
-
-    $match = [regex]::Match(
-        $Html,
-        '<link[^>]+rel=["'']preload["''][^>]+href=["''](?<href>https?://ssr-grid\.fastsimon\.com[^"'']+)["'']',
-        [Text.RegularExpressions.RegexOptions]::IgnoreCase
-    )
-
-    if (-not $match.Success) {
-        return $null
-    }
-
-    $gridUrl = [System.Net.WebUtility]::HtmlDecode(
-        $match.Groups['href'].Value
-    )
-
-    $sort = Get-QueryParameter -Url $CollectionUrl -Name 'sort'
-    $filters = Get-QueryParameter -Url $CollectionUrl -Name 'filters'
-
-    if ($sort) {
-        $gridUrl = Add-QueryParameter `
-            -Url $gridUrl `
-            -Name 'sort' `
-            -Value $sort
-    }
-
-    if ($filters) {
-        $gridUrl = Add-QueryParameter `
-            -Url $gridUrl `
-            -Name 'filters' `
-            -Value $filters
-    }
-
-    return $gridUrl
-}
-
 function Add-ProductUrl {
     param(
         [Parameter(Mandatory)]
@@ -989,8 +782,8 @@ function Add-ProductUrl {
     )
 
     $href = $Href `
-        -replace '\\u0026', '&' `
-        -replace '\\/', '/'
+        -replace '\u0026', '&' `
+        -replace '\/', '/'
 
     if ($href -notmatch '/products/') {
         return $false
@@ -1070,258 +863,26 @@ function Get-ProductLinks {
         [string]$CollectionUrl
     )
 
-    Write-Verbose "Loading collection page: $CollectionUrl"
+    Write-Verbose "Loading collection products JSON: $CollectionUrl"
 
-    $productUrls = New-Object `
-        -TypeName 'System.Collections.Generic.HashSet[string]' `
-        -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
-
-    # The filtered and unfiltered listings of one collection share the same
-    # page, which is only used to find the Fast Simon grid URL.
-    $collectionPath = ([uri]$CollectionUrl).AbsolutePath
-
-    # Shopify products.json is the primary source: it is lightweight, needs
-    # no HTML parsing and returns up to 250 products (with availability) per
-    # request. It cannot apply storefront filters, so filtered URLs and any
-    # JSON failure fall through to the HTML / Fast Simon path below.
-    if (-not (Get-QueryParameter -Url $CollectionUrl -Name 'filters')) {
-        try {
-            $jsonCount = Add-ProductLinksFromCollectionJson `
-                -ProductUrls $productUrls `
-                -CollectionUrl $CollectionUrl
-
-            if ($jsonCount -gt 0) {
-                $CollectionJsonLoaded[$collectionPath] = $true
-                return @($productUrls | Sort-Object)
-            }
-        }
-        catch {
-            if ($_.Exception.Message -like 'Rate limited*' -or
-                $_.Exception.Message -like 'Access blocked*' -or
-                $_.Exception.Message -match '\b429\b|\b403\b') {
-                throw
-            }
-
-            Write-Warning (
-                "Collection products JSON failed for '$CollectionUrl'. " +
-                "Trying collection HTML. Error: $($_.Exception.Message)"
-            )
-        }
-    }
-
-    try {
-        if ($CollectionHtmlCache.ContainsKey($collectionPath)) {
-            Write-Verbose "Reusing collection page for $collectionPath"
-            $html = $CollectionHtmlCache[$collectionPath]
-        }
-        else {
-            $response = Invoke-CherryRequest `
-                -Uri $CollectionUrl `
-                -MaximumAttempts 1
-            $html = $response.Content
-        }
-    }
-    catch {
-        if ($_.Exception.Message -like 'Rate limited*' -or
-            $_.Exception.Message -like 'Access blocked*' -or
-            $_.Exception.Message -match '\b429\b|\b403\b') {
-            throw
-        }
-
-        Write-Warning (
-            "Collection HTML request failed for '$CollectionUrl'. " +
-            "Trying Shopify products JSON fallback. " +
-            "Error: $($_.Exception.Message)"
-        )
-
-        [void](Add-ProductLinksFromCollectionJson `
-            -ProductUrls $productUrls `
-            -CollectionUrl $CollectionUrl)
-
-        return @($productUrls | Sort-Object)
-    }
-
-    $fastSimonGridUrl = Get-FastSimonGridUrl `
-        -Html $html `
-        -CollectionUrl $CollectionUrl
-
-    if ($fastSimonGridUrl) {
-        $CollectionHtmlCache[$collectionPath] = $html
-    }
-
-    # Match rendered product-card links. The base collection HTML can contain
-    # unrelated fallback/product JSON, so prefer the Fast Simon grid HTML above.
-    $patterns = @(
-        'href\s*=\s*["''](?<href>[^"'']*/products/[^"'']+)["'']'
+    $productUrls = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
     )
 
-    $addProductUrls = {
-        param(
-            [Parameter(Mandatory)]
-            [string]$SourceHtml
-        )
+    $collectionPath = ([uri]$CollectionUrl).AbsolutePath
 
-        $addedCount = 0
+    $jsonCount = Add-ProductLinksFromCollectionJson `
+        -ProductUrls $productUrls `
+        -CollectionUrl $CollectionUrl
 
-        foreach ($pattern in $patterns) {
-            foreach ($match in [regex]::Matches(
-                $SourceHtml,
-                $pattern,
-                [Text.RegularExpressions.RegexOptions]::IgnoreCase
-            )) {
-                if (Add-ProductUrl `
-                        -ProductUrls $productUrls `
-                        -Href $match.Groups['href'].Value) {
-                    $addedCount++
-                }
-            }
-        }
-
-        return $addedCount
+    if ($jsonCount -gt 0) {
+        $CollectionJsonLoaded[$collectionPath] = $true
     }
-
-    if ($fastSimonGridUrl) {
-        $maximumGridPages = 10
-
-        for ($page = 1; $page -le $maximumGridPages; $page++) {
-            $pageUrl = Set-QueryParameter `
-                -Url $fastSimonGridUrl `
-                -Name 'page' `
-                -Value $page
-
-            Write-Verbose "Loading Fast Simon grid page $page`: $pageUrl"
-
-            $pageHtml = (Invoke-CherryRequest -Uri $pageUrl).Content
-            $addedCount = & $addProductUrls -SourceHtml $pageHtml
-
-            Write-Verbose "Found $addedCount new product link(s) on grid page $page."
-
-            if ($addedCount -eq 0) {
-                break
-            }
-        }
-    }
-    else {
-        [void](& $addProductUrls -SourceHtml $html)
+    elseif ($jsonCount -eq 0) {
+        Write-Warning "No products found in collection JSON for '$CollectionUrl'."
     }
 
     return @($productUrls | Sort-Object)
-}
-
-function ConvertFrom-HtmlText {
-    param(
-        [AllowEmptyString()]
-        [string]$Text
-    )
-
-    if (-not $Text) {
-        return ''
-    }
-
-    $decoded = [System.Net.WebUtility]::HtmlDecode($Text)
-
-    $decoded = $decoded `
-        -replace '<script\b[^>]*>.*?</script>', ' ' `
-        -replace '<style\b[^>]*>.*?</style>', ' ' `
-        -replace '<[^>]+>', ' ' `
-        -replace '\s+', ' '
-
-    return $decoded.Trim()
-}
-
-function Get-ProductTitle {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Html
-    )
-
-    $titlePatterns = @(
-        '<h1[^>]*>(?<title>.*?)</h1>',
-        '<meta[^>]+property=["'']og:title["''][^>]+content=["''](?<title>.*?)["'']',
-        '<meta[^>]+content=["''](?<title>.*?)["''][^>]+property=["'']og:title["'']',
-        '<title[^>]*>(?<title>.*?)</title>'
-    )
-
-    foreach ($pattern in $titlePatterns) {
-        $match = [regex]::Match(
-            $Html,
-            $pattern,
-            [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
-            [Text.RegularExpressions.RegexOptions]::Singleline
-        )
-
-        if ($match.Success) {
-            $title = ConvertFrom-HtmlText `
-                -Text $match.Groups['title'].Value
-
-            $title = $title `
-                -replace ("\s*[$([char]0x2013)|-]\s*Cherry Collectables.*$"), ''
-
-            if ($title) {
-                return $title.Trim()
-            }
-        }
-    }
-
-    return 'Unknown break'
-}
-
-function Get-SpotsLeft {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Html
-    )
-
-    $text = ConvertFrom-HtmlText -Text $Html
-
-    $soldOutPatterns = @(
-        '\bsold\s*out\b',
-        '\bno\s+spots?\s+left\b',
-        '\bfully\s+allocated\b'
-    )
-
-    foreach ($pattern in $soldOutPatterns) {
-        if ($text -match $pattern) {
-            return [pscustomobject]@{
-                SpotsLeft = 0
-                Status    = 'Sold out'
-                Found     = $true
-            }
-        }
-    }
-
-    $spotPatterns = @(
-        '\bonly\s+(?<spots>\d+)\s+spots?\s+left\b',
-        '\b(?<spots>\d+)\s+spots?\s+left\b',
-        '\bspots?\s+left\s*[:\-]?\s*(?<spots>\d+)\b',
-        '\bremaining\s+spots?\s*[:\-]?\s*(?<spots>\d+)\b',
-        '\b(?<spots>\d+)\s+spots?\s+remaining\b'
-    )
-
-    foreach ($pattern in $spotPatterns) {
-        $match = [regex]::Match(
-            $text,
-            $pattern,
-            [Text.RegularExpressions.RegexOptions]::IgnoreCase
-        )
-
-        if ($match.Success) {
-            $spots = [int]$match.Groups['spots'].Value
-            $noun = if ($spots -eq 1) { 'spot' } else { 'spots' }
-
-            return [pscustomobject]@{
-                SpotsLeft = $spots
-                Status    = "$spots $noun left"
-                Found     = $true
-            }
-        }
-    }
-
-    return [pscustomobject]@{
-        SpotsLeft = $null
-        Status    = 'Spots unavailable'
-        Found     = $false
-    }
 }
 
 function Get-CherryBreak {
@@ -1340,13 +901,12 @@ function Get-CherryBreak {
             $spotResult = Get-SpotsLeftFromProductJson -Product $product
         }
         else {
-            $response = Invoke-CherryRequest `
-                -Uri $ProductUrl `
-                -MaximumAttempts 1
-            $html = $response.Content
-
-            $title = Get-ProductTitle -Html $html
-            $spotResult = Get-SpotsLeft -Html $html
+            $title = 'Unknown break'
+            $spotResult = [pscustomobject]@{
+                SpotsLeft = $null
+                Status    = 'Spots unavailable'
+                Found     = $false
+            }
         }
 
         return [pscustomobject]@{
@@ -1359,7 +919,7 @@ function Get-CherryBreak {
     catch {
         if ($_.Exception.Message -like 'Rate limited*' -or
             $_.Exception.Message -like 'Access blocked*' -or
-            $_.Exception.Message -match '\b429\b|\b403\b') {
+            $_.Exception.Message -match '429|403') {
             throw
         }
 
@@ -1404,7 +964,6 @@ function Remove-DateText {
 
     return ($cleanText -replace '\s+', ' ').Trim()
 }
-
 
 function Get-DailyBreakName {
     param(
@@ -1578,8 +1137,7 @@ function Get-SelectedRecurringBreaks {
         [switch]$IncludeWeeklies
     )
 
-    $selectedResults = New-Object `
-        -TypeName 'System.Collections.Generic.List[object]'
+    $selectedResults = [System.Collections.Generic.List[object]]::new()
 
     if ($IncludeDailies) {
         foreach ($item in @($Results | Where-Object {
@@ -1658,24 +1216,6 @@ function Get-BreakSportEmoji {
     }
 
     return ''
-}
-
-function Get-DayCollectionUrl {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Day
-    )
-
-    return "$BaseUrl/collections/$Day"
-}
-
-function Get-DayProductsCollectionUrl {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Day
-    )
-
-    return "$(Get-DayCollectionUrl -Day $Day)?sort=creation_date"
 }
 
 function Get-DayOpeningsSearchUrl {
@@ -2028,8 +1568,7 @@ function Save-TextResults {
 
     $resolvedPath = Resolve-OutputPath -Path $OutputPath
     $targetDate = Get-TargetDate -Day $Day
-    $lines = New-Object `
-        -TypeName 'System.Collections.Generic.List[string]'
+    $lines = [System.Collections.Generic.List[string]]::new()
 
     $lines.Add(
         ('Cherry break check - {0}, {1}' -f
@@ -2151,8 +1690,7 @@ function Read-TwitchIrcLines {
         [int]$TimeoutMilliseconds = 1000
     )
 
-    $lines = New-Object `
-        -TypeName 'System.Collections.Generic.List[string]'
+    $lines = [System.Collections.Generic.List[string]]::new()
 
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
 
@@ -2285,7 +1823,7 @@ function Send-TwitchChatMessages {
         $cleanToken = "oauth:$cleanToken"
     }
 
-    $tcpClient = New-Object System.Net.Sockets.TcpClient
+    $tcpClient = [System.Net.Sockets.TcpClient]::new()
     $sslStream = $null
     $reader = $null
     $writer = $null
@@ -2294,28 +1832,25 @@ function Send-TwitchChatMessages {
         Write-Host "Connecting to Twitch IRC as $cleanUser for #$cleanChannel..." -ForegroundColor Cyan
         $tcpClient.Connect('irc.chat.twitch.tv', 6697)
 
-        $sslStream = New-Object `
-            System.Net.Security.SslStream(
-                $tcpClient.GetStream(),
-                $false,
-                ({ $true } -as [Net.Security.RemoteCertificateValidationCallback])
-            )
+        $sslStream = [System.Net.Security.SslStream]::new(
+            $tcpClient.GetStream(),
+            $false,
+            ({ $true } -as [Net.Security.RemoteCertificateValidationCallback])
+        )
 
         $sslStream.AuthenticateAsClient('irc.chat.twitch.tv')
 
-        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
-        $reader = New-Object `
-            System.IO.StreamReader(
-                $sslStream,
-                $utf8NoBom
-            )
+        $reader = [System.IO.StreamReader]::new(
+            $sslStream,
+            $utf8NoBom
+        )
 
-        $writer = New-Object `
-            System.IO.StreamWriter(
-                $sslStream,
-                $utf8NoBom
-            )
+        $writer = [System.IO.StreamWriter]::new(
+            $sslStream,
+            $utf8NoBom
+        )
         $writer.NewLine = "`r`n"
         $writer.AutoFlush = $true
 
@@ -2390,7 +1925,7 @@ function Send-TwitchChatMessages {
                 Write-Host "Submitted Twitch chat message: $message" -ForegroundColor Green
             }
 
-            Start-Sleep -Seconds $DelaySeconds
+            Start-Sleep -Seconds ($DelaySeconds)
         }
     }
     finally {
@@ -2468,25 +2003,23 @@ function Publish-TwitchResults {
 function Invoke-BreakCheck {
     $targetDay = Get-TargetDay -RequestedDay $Day
     $targetDate = Get-TargetDate -Day $targetDay
-    $isWeeklyOnlySearch = $Weeklies -and -not $Dailies
 
-    $results = New-Object `
-        -TypeName 'System.Collections.Generic.List[object]'
+    $results = [System.Collections.Generic.List[object]]::new()
     $checkAborted = $false
 
     Write-Host ''
     Write-Host 'Checking all breaks...' -ForegroundColor Cyan
 
     try {
-        $productLinkSet = New-Object `
-            -TypeName 'System.Collections.Generic.HashSet[string]' `
-            -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+        $productLinkSet = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
 
-        # Load the unfiltered collection first. It uses products.json when
-        # possible, which also fills the product cache.
+        # Load the breaks collection from Shopify products.json.
+        # This returns all active breaks and seeds the product cache in one call.
         $fallbackCollectionUrl = Get-UnfilteredCollectionUrl
         Write-Verbose (
-            "Checking unfiltered collection for URL dates matching " +
+            "Checking unfiltered collection for breaks matching " +
             "$targetDay`: $fallbackCollectionUrl"
         )
 
@@ -2495,50 +2028,9 @@ function Invoke-BreakCheck {
                 -CollectionUrl $fallbackCollectionUrl
         )
 
-        $unfilteredPath = ([uri]$fallbackCollectionUrl).AbsolutePath
-        $jsonCoveredCollection = $CollectionJsonLoaded.ContainsKey($unfilteredPath)
-
-        if (-not $isWeeklyOnlySearch) {
-            # The day filter only exists in the HTML storefront. When the JSON
-            # listing loaded, the date matching below replaces that request.
-            if (-not $jsonCoveredCollection) {
-                $collectionUrl = Get-CollectionUrl `
-                    -Day $targetDay
-
-                Write-Verbose "Collection URL: $collectionUrl"
-
-                $productLinks = @(
-                    Get-ProductLinks `
-                        -CollectionUrl $collectionUrl
-                )
-
-                foreach ($productUrl in $productLinks) {
-                    [void]$productLinkSet.Add($productUrl)
-                }
-            }
-
-            $dayProductsCollectionUrl = Get-DayProductsCollectionUrl `
-                -Day $targetDay
-
-            Write-Verbose (
-                "Checking day collection for live openings matching " +
-                "$targetDay`: $dayProductsCollectionUrl"
-            )
-
-            $dayProductLinks = @(
-                Get-ProductLinks `
-                    -CollectionUrl $dayProductsCollectionUrl
-            )
-
-            foreach ($productUrl in $dayProductLinks) {
-                [void]$productLinkSet.Add($productUrl)
-            }
-        }
-
-        # Every candidate is about to be checked, so load their product JSON
-        # concurrently instead of one request at a time.
+        # Candidate products are already cached from products.json.
         Read-ProductJsonIntoCache `
-            -ProductUrls (@($productLinkSet) + $fallbackProductLinks)
+            -ProductUrls $fallbackProductLinks
 
         foreach ($productUrl in $fallbackProductLinks) {
             if ($Weeklies -or
