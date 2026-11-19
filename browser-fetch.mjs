@@ -25,12 +25,16 @@ const headed = args.includes('--headed');
 const profile = opt('--profile', join(import.meta.dirname, '.browser-profile'));
 const timeoutMs = Number(opt('--timeout', '60')) * 1000;
 
-function fail(message, code = 2) {
-  process.stdout.write(JSON.stringify({ status: 0, body: '', challenged: false, error: message }));
-  process.exit(code);
+// Never call process.exit() after writing to stdout: on a pipe the write is async on
+// POSIX and exit() truncates large payloads. Set exitCode and let the process drain.
+function emit(result, code) {
+  process.stdout.write(JSON.stringify(result));
+  process.exitCode = code;
 }
 
-if (!url) fail('Usage: node browser-fetch.mjs <url> [--headed] [--profile <dir>] [--timeout <sec>]');
+function fail(message, code = 2) {
+  emit({ status: 0, body: '', challenged: false, error: message }, code);
+}
 
 const isChallenge = (title) => /Verifying|Just a moment|Attention Required/i.test(title || '');
 
@@ -52,6 +56,7 @@ async function launch() {
 
 let context;
 try {
+  if (!url) throw new Error('Usage: node browser-fetch.mjs <url> [--headed] [--profile <dir>] [--timeout <sec>]');
   context = await launch();
   const page = context.pages()[0] ?? (await context.newPage());
 
@@ -73,8 +78,7 @@ try {
   }
 
   const body = challenged ? '' : await page.evaluate(() => document.body.innerText);
-  process.stdout.write(JSON.stringify({ status, body, challenged }));
-  process.exit(challenged ? 3 : 0);
+  emit({ status, body, challenged }, challenged ? 3 : 0);
 } catch (e) {
   fail(String(e.message ?? e).split('\n')[0], 1);
 } finally {

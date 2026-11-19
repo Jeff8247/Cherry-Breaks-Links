@@ -72,8 +72,10 @@ to be installed on Windows 11:
    Windows 11 with Edge.
 2. **Node + Playwright (optional).** If Node.js 18+ is installed and `npm install` has
    been run in the script folder, `browser-fetch.mjs` is used instead. It also works
-   on macOS and Linux (on Linux/WSL run `sudo npx playwright install-deps chromium`
-   first), and it supports `-Headed`.
+   on macOS and Linux, and it supports `-Headed`. If no Chrome/Edge is installed, download
+   Playwright's browser with `npx playwright-core install chromium-headless-shell`
+   (no sudo; verified in WSL). Only if it then fails to start on Linux, run
+   `sudo npx playwright install-deps chromium`.
 
 Switches:
 

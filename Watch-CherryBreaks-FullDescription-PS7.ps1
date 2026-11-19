@@ -635,7 +635,7 @@ function Invoke-CherryBrowserRequest {
         throw "Browser fallback failed (exit $exitCode): $(($output | Out-String).Trim())"
     }
     if ($json.PSObject.Properties['error'] -and $json.error) {
-        throw "Browser fallback failed: $($json.error). On Linux you may need: npx playwright install-deps chromium"
+        throw "Browser fallback failed: $($json.error). If the browser is missing run: npx playwright-core install chromium-headless-shell (on Linux, if it then fails to start: sudo npx playwright install-deps chromium)"
     }
     if ($json.challenged) {
         throw "Access blocked (HTTP 403) by '$Uri'. The browser could not pass the Cloudflare challenge; try -Headed."
