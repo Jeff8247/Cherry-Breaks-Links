@@ -578,8 +578,19 @@ function Invoke-CherryNativeBrowserRequest {
         $content = [System.Net.WebUtility]::HtmlDecode($Matches[1])
     }
 
-    # A .json URL that did not yield JSON is an error/interstitial page, not data: say what it was
-    if ($Uri -match '\.json(\?|$)' -and $content.TrimStart() -notmatch '^[\{\[]') {
+    # A .json URL that did not yield JSON (or a products.json without "products") is an
+    # error/interstitial page or an unexpected payload, not data: say what it was
+    $badJson = $false
+    if ($Uri -match '\.json(\?|$)') {
+        if ($content.TrimStart() -notmatch '^[\{\[]') { $badJson = $true }
+        elseif ($Uri -match 'products\.json' -and $content -notmatch '"products"\s*:') { $badJson = $true }
+    }
+    if ($badJson) {
+        if ($content.TrimStart() -match '^[\{\[]') {
+            $snippet = ($content -replace '\s+', ' ')
+            if ($snippet.Length -gt 300) { $snippet = $snippet.Substring(0, 300) + '...' }
+            throw "Browser fallback failed: '$Uri' returned JSON without a 'products' key: $snippet"
+        }
         $title = if ($dom -match '(?is)<title[^>]*>(.*?)</title>') { ($Matches[1] -replace '\s+', ' ').Trim() } else { '(none)' }
         $text = ($dom -replace '(?is)<(script|style)[^>]*>.*?</\1>', ' ' -replace '<[^>]+>', ' ' -replace '\s+', ' ').Trim()
         if ($text.Length -gt 300) { $text = $text.Substring(0, 300) + '...' }
