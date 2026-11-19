@@ -501,9 +501,79 @@ function Invoke-CherryCurlRequest {
 
 $script:BrowserFallbackDisabled = $false
 
+function Get-NativeBrowserPath {
+    # Finds a Chromium-based browser that is already installed (Edge ships with Windows 11).
+    $candidates = @()
+    foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA)) {
+        if ($root) {
+            $candidates += Join-Path $root 'Microsoft\Edge\Application\msedge.exe'
+            $candidates += Join-Path $root 'Google\Chrome\Application\chrome.exe'
+        }
+    }
+    $candidates += '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+    $candidates += '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'
+
+    foreach ($path in $candidates) {
+        if ($path -and (Test-Path -LiteralPath $path)) { return $path }
+    }
+    foreach ($name in 'microsoft-edge', 'google-chrome', 'chromium', 'chromium-browser') {
+        $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cmd) { return $cmd.Source }
+    }
+    return $null
+}
+
+function Invoke-CherryNativeBrowserRequest {
+    # No-install fallback: drive the system's own Edge/Chrome headless and dump the page.
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri
+    )
+
+    $browser = Get-NativeBrowserPath
+    if (-not $browser) {
+        throw 'Browser fallback unavailable: no Edge or Chrome found.'
+    }
+
+    $profileDir = Join-Path $PSScriptRoot '.browser-profile/native'
+    $null = New-Item -ItemType Directory -Force -Path $profileDir
+
+    Write-Verbose "Cloudflare challenge: retrying '$Uri' in $browser (headless)."
+    $output = & $browser `
+        --headless=new `
+        --disable-gpu `
+        --no-first-run `
+        --no-default-browser-check `
+        "--user-data-dir=$profileDir" `
+        '--virtual-time-budget=20000' `
+        --dump-dom `
+        $Uri 2>$null
+    $exitCode = $LASTEXITCODE
+
+    $dom = ($output | Out-String)
+    if ($exitCode -ne 0 -and -not $dom.Trim()) {
+        throw "Browser fallback failed (exit $exitCode) running $browser."
+    }
+    if ($dom -match '<title>[^<]*(Verifying|Just a moment|Attention Required)') {
+        throw "Access blocked (HTTP 403) by '$Uri'. The headless browser could not pass the Cloudflare challenge."
+    }
+
+    # Chromium renders a JSON response as <pre>...</pre>; unwrap it for .json URLs
+    $content = $dom
+    if ($Uri -match '\.json(\?|$)' -and $dom -match '(?s)<pre[^>]*>(.*?)</pre>') {
+        $content = [System.Net.WebUtility]::HtmlDecode($Matches[1])
+    }
+
+    return [pscustomobject]@{
+        Content    = $content
+        StatusCode = 200
+    }
+}
+
 function Invoke-CherryBrowserRequest {
-    # Fallback for Cloudflare managed challenges: load the URL in a real browser
-    # via browser-fetch.mjs (Node + Playwright). Works on Windows, macOS and Linux.
+    # Fallback for Cloudflare managed challenges: load the URL in a real browser.
+    # Prefers the Node + Playwright helper when it is set up; otherwise uses the
+    # system's own Edge/Chrome so nothing has to be installed.
     param(
         [Parameter(Mandatory)]
         [string]$Uri
@@ -512,9 +582,10 @@ function Invoke-CherryBrowserRequest {
     $helper = Join-Path $PSScriptRoot 'browser-fetch.mjs'
     $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 
-    if (-not $node -or -not (Test-Path -LiteralPath $helper) -or
+    if (-not $node -or
+        -not (Test-Path -LiteralPath $helper) -or
         -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'node_modules/playwright-core'))) {
-        throw 'Browser fallback unavailable. Install Node.js and run "npm install" in the script folder.'
+        return Invoke-CherryNativeBrowserRequest -Uri $Uri
     }
 
     $nodeArgs = @($helper, $Uri)
