@@ -578,6 +578,14 @@ function Invoke-CherryNativeBrowserRequest {
         $content = [System.Net.WebUtility]::HtmlDecode($Matches[1])
     }
 
+    # A .json URL that did not yield JSON is an error/interstitial page, not data: say what it was
+    if ($Uri -match '\.json(\?|$)' -and $content.TrimStart() -notmatch '^[\{\[]') {
+        $title = if ($dom -match '(?is)<title[^>]*>(.*?)</title>') { ($Matches[1] -replace '\s+', ' ').Trim() } else { '(none)' }
+        $text = ($dom -replace '(?is)<(script|style)[^>]*>.*?</\1>', ' ' -replace '<[^>]+>', ' ' -replace '\s+', ' ').Trim()
+        if ($text.Length -gt 300) { $text = $text.Substring(0, 300) + '...' }
+        throw "Browser fallback failed: '$Uri' did not return JSON. Page title: '$title'. Text: $text"
+    }
+
     return [pscustomobject]@{
         Content    = $content
         StatusCode = 200
