@@ -62,26 +62,30 @@ curl. No header tweak gets past it, and it affects every path, including
 `products.json` and the sitemaps. It is separate from the 429 rate limit, which a
 browser does not avoid.
 
-When the script gets a 403, it retries that request in a real browser. Nothing has
-to be installed on Windows 11:
+By default the script loads every request in a real browser, which passes the
+challenge. Nothing has to be installed on Windows 11:
 
-1. **System Edge/Chrome (default, no install).** The script runs the Edge or Chrome
-   already on the machine headless (`--dump-dom`), waits for the challenge to finish,
-   and reads the JSON from the page. A profile is kept in `.browser-profile/native`
-   beside the script so Cloudflare's clearance cookie is reused. Verified working on
-   Windows 11 with Edge.
+1. **System Edge/Chrome (no install).** The script runs the Edge or Chrome already on
+   the machine headless (`--dump-dom`), waits for the challenge to finish, and reads
+   the JSON from the page. A profile is kept in `.browser-profile/native` beside the
+   script so Cloudflare's clearance cookie is reused. Verified working on Windows 11
+   with Edge.
 2. **Node + Playwright (optional).** If Node.js 18+ is installed and `npm install` has
    been run in the script folder, `browser-fetch.mjs` is used instead. It also works
-   on macOS and Linux, and it supports `-Headed`. If no Chrome/Edge is installed, download
-   Playwright's browser with `npx playwright-core install chromium-headless-shell`
-   (no sudo; verified in WSL). Only if it then fails to start on Linux, run
+   on macOS and Linux, and it supports `-Headed`. If no Chrome/Edge is installed,
+   download Playwright's browser with
+   `npx playwright-core install chromium-headless-shell` (no sudo; verified in WSL).
+   Only if it then fails to start on Linux, run
    `sudo npx playwright install-deps chromium`.
+
+If the browser cannot run at all, the script warns once and uses curl for the rest of
+the run.
 
 Switches:
 
-- `-UseBrowser` sends every request through the browser instead of curl. It is slower
-  and not needed for normal runs; without it the browser is only used after a 403.
-- `-NoBrowser` disables the fallback.
+- `-NoBrowser` uses curl / `Invoke-WebRequest` only. It is faster but gets a 403 whenever
+  Cloudflare challenges the request.
+- `-UseBrowser` is accepted for compatibility; the browser is already the default.
 - `-Headed` shows the window (Node + Playwright route only).
 
 If the browser cannot get through, the error says why (for example, a Cloudflare

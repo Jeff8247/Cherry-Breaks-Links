@@ -60,10 +60,10 @@ param(
 
     [string]$EnvPath = '.env',
 
-    # Never fall back to the real-browser helper when Cloudflare challenges a request
+    # Use curl / Invoke-WebRequest only; do not use the real browser (the default is the browser)
     [switch]$NoBrowser,
 
-    # Send every request through the real-browser helper instead of curl
+    # Kept for compatibility: the real browser is now the default for every request
     [switch]$UseBrowser,
 
     # Show the browser window when the fallback runs (more reliable against Cloudflare)
@@ -538,7 +538,7 @@ function Invoke-CherryNativeBrowserRequest {
     $profileDir = Join-Path $PSScriptRoot '.browser-profile/native'
     $null = New-Item -ItemType Directory -Force -Path $profileDir
 
-    Write-Verbose "Cloudflare challenge: retrying '$Uri' in $browser (headless)."
+    Write-Verbose "Loading '$Uri' in $browser (headless)."
     # Edge/Chrome are GUI-subsystem programs on Windows, so '&' neither waits for them
     # nor captures their stdout. Start-Process -Wait with file redirection does both.
     $outFile = [System.IO.Path]::GetTempFileName()
@@ -604,7 +604,7 @@ function Invoke-CherryNativeBrowserRequest {
 }
 
 function Invoke-CherryBrowserRequest {
-    # Fallback for Cloudflare managed challenges: load the URL in a real browser.
+    # Load the URL in a real browser (the default; it passes Cloudflare's managed challenge).
     # Prefers the Node + Playwright helper when it is set up; otherwise uses the
     # system's own Edge/Chrome so nothing has to be installed.
     param(
@@ -624,7 +624,7 @@ function Invoke-CherryBrowserRequest {
     $nodeArgs = @($helper, $Uri)
     if ($Headed) { $nodeArgs += '--headed' }
 
-    Write-Verbose "Cloudflare challenge: retrying '$Uri' in a real browser."
+    Write-Verbose "Loading '$Uri' in a real browser."
     $output = & $node.Source @nodeArgs 2>&1
     $exitCode = $LASTEXITCODE
 
@@ -659,8 +659,21 @@ function Invoke-CherryRequest {
         [int]$MaximumAttempts = 3
     )
 
-    if ($UseBrowser -and -not $NoBrowser) {
-        return Invoke-CherryBrowserRequest -Uri $Uri
+    # The real browser is the default. If it cannot run at all (no Edge/Chrome, no
+    # Playwright), warn once and carry on with curl for the rest of the run.
+    if (-not $NoBrowser -and -not $script:BrowserFallbackDisabled) {
+        try {
+            return Invoke-CherryBrowserRequest -Uri $Uri
+        }
+        catch {
+            if ($_.Exception.Message -like 'Browser fallback*') {
+                $script:BrowserFallbackDisabled = $true
+                Write-Warning "$($_.Exception.Message) Falling back to curl for this run."
+            }
+            else {
+                throw
+            }
+        }
     }
 
     $curlCommand = Get-NativeCurlCommand
@@ -704,24 +717,6 @@ function Invoke-CherryRequest {
                         }
                     }
                 } catch { }
-            }
-
-            # Cloudflare managed challenge: retry once in a real browser (Node + Playwright)
-            if (($statusCode -eq 403 -or ($_.Exception.Message -match '403|Forbidden')) -and
-                -not $NoBrowser -and -not $script:BrowserFallbackDisabled) {
-                try {
-                    return Invoke-CherryBrowserRequest -Uri $Uri
-                }
-                catch {
-                    if ($_.Exception.Message -like 'Browser fallback*') {
-                        # Don't retry the browser for every URL if it can't run at all
-                        $script:BrowserFallbackDisabled = $true
-                        Write-Warning $_.Exception.Message
-                    }
-                    else {
-                        throw
-                    }
-                }
             }
 
             # Detect rate-limiting (HTTP 429) across all checks
