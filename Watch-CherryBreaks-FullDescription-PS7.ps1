@@ -1074,6 +1074,11 @@ function Add-ProductLinksFromCollectionJson {
             -Uri $pageUrl `
             -MaximumAttempts 1
         $json = $response.Content | ConvertFrom-Json
+        if (-not $json -or -not $json.PSObject.Properties['products']) {
+            $snippet = ([string]$response.Content -replace '\s+', ' ')
+            if ($snippet.Length -gt 300) { $snippet = $snippet.Substring(0, 300) + '...' }
+            throw "Unexpected response from '$pageUrl' (no 'products' property). Content starts: $snippet"
+        }
         $products = @($json.products)
 
         foreach ($product in $products) {
