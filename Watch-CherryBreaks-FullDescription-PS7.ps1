@@ -539,20 +539,34 @@ function Invoke-CherryNativeBrowserRequest {
     $null = New-Item -ItemType Directory -Force -Path $profileDir
 
     Write-Verbose "Cloudflare challenge: retrying '$Uri' in $browser (headless)."
-    $output = & $browser `
-        --headless=new `
-        --disable-gpu `
-        --no-first-run `
-        --no-default-browser-check `
-        "--user-data-dir=$profileDir" `
-        '--virtual-time-budget=20000' `
-        --dump-dom `
-        $Uri 2>$null
-    $exitCode = $LASTEXITCODE
+    # Edge/Chrome are GUI-subsystem programs on Windows, so '&' neither waits for them
+    # nor captures their stdout. Start-Process -Wait with file redirection does both.
+    $outFile = [System.IO.Path]::GetTempFileName()
+    $errFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $browserArgs = @(
+            '--headless=new',
+            '--disable-gpu',
+            '--no-first-run',
+            '--no-default-browser-check',
+            "--user-data-dir=`"$profileDir`"",
+            '--virtual-time-budget=20000',
+            '--dump-dom',
+            "`"$Uri`""
+        )
+        $proc = Start-Process -FilePath $browser -ArgumentList $browserArgs `
+            -Wait -PassThru -NoNewWindow `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        $exitCode = $proc.ExitCode
+        $dom = Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue
+        if (-not $dom) { $dom = '' }
+    }
+    finally {
+        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
 
-    $dom = ($output | Out-String)
-    if ($exitCode -ne 0 -and -not $dom.Trim()) {
-        throw "Browser fallback failed (exit $exitCode) running $browser."
+    if (-not $dom.Trim()) {
+        throw "Browser fallback failed (exit $exitCode): $browser produced no output."
     }
     if ($dom -match '<title>[^<]*(Verifying|Just a moment|Attention Required)') {
         throw "Access blocked (HTTP 403) by '$Uri'. The headless browser could not pass the Cloudflare challenge."
