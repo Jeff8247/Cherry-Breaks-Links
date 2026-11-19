@@ -58,41 +58,54 @@ HTML collection pages and has no 429 handling.
 
 Cherry Collectables sits behind Cloudflare, which intermittently serves a managed
 challenge (`HTTP 403`, `cf-mitigated: challenge`) to non-browser clients such as
-curl. When that happens, no header tweak will get past it. It affects every path,
-including `products.json` and the sitemaps.
+curl. No header tweak gets past it, and it affects every path, including
+`products.json` and the sitemaps. It is separate from the 429 rate limit, which a
+browser does not avoid.
 
-To handle this, the script falls back to a real browser on a 403. It runs
-`browser-fetch.mjs` (Node.js + Playwright), which loads the URL in Chrome, Edge or
-Chromium, waits for the challenge to complete, and returns the page text. The
-fallback works on Windows, macOS and Linux and keeps its browser profile in
-`.browser-profile/` so the Cloudflare clearance cookie is reused between runs.
+When the script gets a 403, it retries that request in a real browser. Nothing has
+to be installed on Windows 11:
 
-Setup (only needed for the fallback):
+1. **System Edge/Chrome (default, no install).** The script runs the Edge or Chrome
+   already on the machine headless (`--dump-dom`), waits for the challenge to finish,
+   and reads the JSON from the page. A profile is kept in `.browser-profile/native`
+   beside the script so Cloudflare's clearance cookie is reused. Verified working on
+   Windows 11 with Edge.
+2. **Node + Playwright (optional).** If Node.js 18+ is installed and `npm install` has
+   been run in the script folder, `browser-fetch.mjs` is used instead. It also works
+   on macOS and Linux (on Linux/WSL run `sudo npx playwright install-deps chromium`
+   first), and it supports `-Headed`.
+
+Switches:
+
+- `-UseBrowser` sends every request through the browser instead of curl. It is slower
+  and not needed for normal runs; without it the browser is only used after a 403.
+- `-NoBrowser` disables the fallback.
+- `-Headed` shows the window (Node + Playwright route only).
+
+If the browser cannot get through, the error says why (for example, a Cloudflare
+page title, or the JSON it received instead of `products`).
+
+Please keep request volume low and check Cherry Collectables' terms; asking them for
+an official feed or allowlisting is the most reliable fix.
+
+### Windows: "file is not digitally signed"
+
+A script downloaded from the internet is blocked by the default execution policy.
+Unblock it once, or bypass for a single run:
 
 ```powershell
-npm install
+Unblock-File .\Watch-CherryBreaks-FullDescription-PS7.ps1
+pwsh -ExecutionPolicy Bypass -File .\Watch-CherryBreaks-FullDescription-PS7.ps1
 ```
 
-- **Windows/macOS:** an installed Chrome or Edge is used automatically; otherwise run
-  `npx playwright install chromium`.
-- **Linux/WSL:** Chromium needs system libraries. Install them once with
-  `sudo npx playwright install-deps chromium` (plus `npx playwright install chromium`
-  if no browser is installed). Without them the script prints a warning and continues
-  to fail with the normal 403 error.
-- `-Headed` shows the browser window, which is more reliable against Cloudflare.
-- `-NoBrowser` disables the fallback entirely.
-
-Status: the fallback has not yet been tested against a live challenge, because
-Cloudflare stopped challenging the script's plain requests while it was being built.
-This is automation of a site's bot protection, so check Cherry Collectables' terms,
-keep request volume low, and consider asking them for an official feed or allowlisting.
+Run it from PowerShell 7 (`pwsh`), not Windows PowerShell 5.1.
 
 ## Requirements
 
 - PowerShell 7.0 or later (`pwsh`)
 - Internet access to `cherrycollectables.com.au`
 - Recommended: `curl.exe` / `curl` 7.66 or newer (included with Windows 10/11 and Linux)
-- Optional, for the Cloudflare browser fallback: Node.js 18+ and `npm install`
+- For the Cloudflare browser fallback: Microsoft Edge or Google Chrome (Edge is built into Windows 11). Node.js 18+ and `npm install` are optional.
 
 ## Usage
 
