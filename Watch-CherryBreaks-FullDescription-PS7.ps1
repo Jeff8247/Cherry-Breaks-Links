@@ -58,7 +58,13 @@ param(
     [ValidateRange(1, 30)]
     [int]$TwitchMessageDelaySeconds = 3,
 
-    [string]$EnvPath = '.env'
+    [string]$EnvPath = '.env',
+
+    # Never fall back to the real-browser helper when Cloudflare challenges a request
+    [switch]$NoBrowser,
+
+    # Show the browser window when the fallback runs (more reliable against Cloudflare)
+    [switch]$Headed
 )
 
 Set-StrictMode -Version Latest
@@ -364,6 +370,52 @@ function Get-NativeCurlCommand {
     ) | Select-Object -First 1
 }
 
+function Get-CherryBlockDiagnostics {
+    # Summarises a blocked/rate-limited response so we can tell a Cloudflare
+    # challenge from a Shopify rate limit or a plain WAF rule.
+    param(
+        [string]$RawHeaders,
+        [string]$Body
+    )
+
+    $interesting = 'server|cf-ray|cf-mitigated|cf-cache-status|content-type|retry-after|x-shopify-stage|x-request-id|x-sorting-hat|set-cookie'
+    $lines = @()
+
+    if ($RawHeaders) {
+        # curl --dump-header may hold several blocks (redirects); keep the last one
+        $blocks = @($RawHeaders -split "(?:\r?\n){2,}" | Where-Object { $_.Trim() })
+        if ($blocks.Count -gt 0) {
+            foreach ($line in ($blocks[-1] -split "\r?\n")) {
+                if ($line -match '^HTTP/' -or $line -match "^($interesting):") {
+                    # Don't print cookie values, only their names
+                    if ($line -match '^set-cookie:\s*([^=]+)=') { $line = "set-cookie: $($Matches[1])=<redacted>" }
+                    $lines += "    $line"
+                }
+            }
+        }
+    }
+
+    $hint = ''
+    if ($RawHeaders -match '(?im)^cf-mitigated:\s*challenge') { $hint = 'Cloudflare managed challenge (needs a real browser).' }
+    elseif ($RawHeaders -match '(?im)^server:\s*cloudflare' -and $Body -match 'Just a moment|cf-chl|challenge-platform') { $hint = 'Cloudflare interstitial challenge page.' }
+    elseif ($RawHeaders -match '(?im)^server:\s*cloudflare' -and $Body -match 'Attention Required|Sorry, you have been blocked') { $hint = 'Cloudflare WAF block page.' }
+    elseif ($RawHeaders -match '(?im)^x-shopify-stage|^x-sorting-hat') { $hint = 'Served by Shopify directly (not a Cloudflare challenge).' }
+
+    $snippet = ''
+    if ($Body) {
+        $snippet = ($Body -replace '\s+', ' ')
+        if ($snippet.Length -gt 300) { $snippet = $snippet.Substring(0, 300) + '...' }
+    }
+
+    $out = [System.Text.StringBuilder]::new()
+    [void]$out.AppendLine()
+    [void]$out.AppendLine('  --- Block diagnostics ---')
+    if ($lines.Count -gt 0) { [void]$out.AppendLine(($lines -join [Environment]::NewLine)) }
+    if ($hint)    { [void]$out.AppendLine("  Likely cause: $hint") }
+    if ($snippet) { [void]$out.AppendLine("  Body: $snippet") }
+    return $out.ToString().TrimEnd()
+}
+
 function Invoke-CherryCurlRequest {
     param(
         [Parameter(Mandatory)]
@@ -376,6 +428,8 @@ function Invoke-CherryCurlRequest {
         throw 'Native curl was not found.'
     }
 
+    $headerFile = [System.IO.Path]::GetTempFileName()
+
     $arguments = @(
         '--location',
         '--silent',
@@ -384,13 +438,21 @@ function Invoke-CherryCurlRequest {
         '45',
         '--user-agent',
         $Headers['User-Agent'],
+        '--dump-header',
+        $headerFile,
         '--write-out',
         "`n%{http_code}",
         $Uri
     )
 
-    $output = & $curlCommand.Source @arguments 2>&1
-    $exitCode = $LASTEXITCODE
+    try {
+        $output = & $curlCommand.Source @arguments 2>&1
+        $exitCode = $LASTEXITCODE
+        $rawHeaders = if (Test-Path -LiteralPath $headerFile) { Get-Content -LiteralPath $headerFile -Raw } else { '' }
+    }
+    finally {
+        Remove-Item -LiteralPath $headerFile -Force -ErrorAction SilentlyContinue
+    }
 
     $lines = @($output)
     $httpCode = 0
@@ -410,11 +472,13 @@ function Invoke-CherryCurlRequest {
     $rawContent = ($lines -join [Environment]::NewLine)
 
     if ($httpCode -eq 429 -or ($exitCode -eq 22 -and ($rawContent -match '429|local_rate_limited'))) {
-        throw "Rate limited (HTTP 429) by '$Uri'."
+        $diag = Get-CherryBlockDiagnostics -RawHeaders $rawHeaders -Body $rawContent
+        throw "Rate limited (HTTP 429) by '$Uri'.$diag"
     }
 
     if ($httpCode -eq 403 -or ($exitCode -eq 22 -and ($rawContent -match '403|Forbidden'))) {
-        throw "Access blocked (HTTP 403) by '$Uri'."
+        $diag = Get-CherryBlockDiagnostics -RawHeaders $rawHeaders -Body $rawContent
+        throw "Access blocked (HTTP 403) by '$Uri'.$diag"
     }
 
     if ($exitCode -ne 0) {
@@ -429,6 +493,53 @@ function Invoke-CherryCurlRequest {
     return [pscustomobject]@{
         Content    = $rawContent
         StatusCode = $httpCode
+    }
+}
+
+$script:BrowserFallbackDisabled = $false
+
+function Invoke-CherryBrowserRequest {
+    # Fallback for Cloudflare managed challenges: load the URL in a real browser
+    # via browser-fetch.mjs (Node + Playwright). Works on Windows, macOS and Linux.
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri
+    )
+
+    $helper = Join-Path $PSScriptRoot 'browser-fetch.mjs'
+    $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    if (-not $node -or -not (Test-Path -LiteralPath $helper) -or
+        -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'node_modules/playwright-core'))) {
+        throw 'Browser fallback unavailable. Install Node.js and run "npm install" in the script folder.'
+    }
+
+    $nodeArgs = @($helper, $Uri)
+    if ($Headed) { $nodeArgs += '--headed' }
+
+    Write-Verbose "Cloudflare challenge: retrying '$Uri' in a real browser."
+    $output = & $node.Source @nodeArgs 2>&1
+    $exitCode = $LASTEXITCODE
+
+    $json = $null
+    try { $json = ($output | Out-String) | ConvertFrom-Json } catch { }
+
+    if (-not $json) {
+        throw "Browser fallback failed (exit $exitCode): $(($output | Out-String).Trim())"
+    }
+    if ($json.PSObject.Properties['error'] -and $json.error) {
+        throw "Browser fallback failed: $($json.error). On Linux you may need: npx playwright install-deps chromium"
+    }
+    if ($json.challenged) {
+        throw "Access blocked (HTTP 403) by '$Uri'. The browser could not pass the Cloudflare challenge; try -Headed."
+    }
+    if ([int]$json.status -ge 400) {
+        throw "HTTP $($json.status) returned by '$Uri'."
+    }
+
+    return [pscustomobject]@{
+        Content    = [string]$json.body
+        StatusCode = [int]$json.status
     }
 }
 
@@ -484,6 +595,24 @@ function Invoke-CherryRequest {
                 } catch { }
             }
 
+            # Cloudflare managed challenge: retry once in a real browser (Node + Playwright)
+            if (($statusCode -eq 403 -or ($_.Exception.Message -match '403|Forbidden')) -and
+                -not $NoBrowser -and -not $script:BrowserFallbackDisabled) {
+                try {
+                    return Invoke-CherryBrowserRequest -Uri $Uri
+                }
+                catch {
+                    if ($_.Exception.Message -like 'Browser fallback*') {
+                        # Don't retry the browser for every URL if it can't run at all
+                        $script:BrowserFallbackDisabled = $true
+                        Write-Warning $_.Exception.Message
+                    }
+                    else {
+                        throw
+                    }
+                }
+            }
+
             # Detect rate-limiting (HTTP 429) across all checks
             if ($statusCode -eq 429 -or ($_.Exception.Message -match '429|Too Many Requests')) {
                 $wait = if ($retryAfterSeconds) { " Retry after $([int]$retryAfterSeconds) seconds." } else { '' }
@@ -491,7 +620,14 @@ function Invoke-CherryRequest {
             }
 
             if ($statusCode -eq 403 -or ($_.Exception.Message -match '403|Forbidden')) {
-                Write-Verbose "Request received 403 Forbidden for '$Uri'."
+                $rawHdr = ''
+                try {
+                    if ($_.Exception.Response -and $_.Exception.Response.Headers) {
+                        $rawHdr = ($_.Exception.Response.Headers | ForEach-Object { "$($_.Key): $($_.Value -join ', ')" }) -join "`n"
+                    }
+                } catch { }
+                $body = if ($_.ErrorDetails) { [string]$_.ErrorDetails.Message } else { '' }
+                Write-Verbose "Request received 403 Forbidden for '$Uri'.$(Get-CherryBlockDiagnostics -RawHeaders $rawHdr -Body $body)"
             }
 
             if (-not $curlCommand -and $attempt -eq $MaximumAttempts) {

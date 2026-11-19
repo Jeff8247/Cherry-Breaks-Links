@@ -50,12 +50,49 @@ HTML collection pages and has no 429 handling.
 - Run with `-Verbose` to see diagnostic information such as which source was used.
 - It detects HTTP 429 (rate limited) and 403 (blocked). It halts immediately instead
   of cascading into more requests, and advises how long to wait so the IP block can reset.
+- On a 403 or 429 it prints block diagnostics: the status line, key headers
+  (`cf-mitigated`, `cf-ray`, `server`, `retry-after`), a body snippet, and the
+  likely cause (for example a Cloudflare managed challenge). Cookie values are redacted.
+
+## Cloudflare Challenges and the Browser Fallback
+
+Cherry Collectables sits behind Cloudflare, which intermittently serves a managed
+challenge (`HTTP 403`, `cf-mitigated: challenge`) to non-browser clients such as
+curl. When that happens, no header tweak will get past it. It affects every path,
+including `products.json` and the sitemaps.
+
+To handle this, the script falls back to a real browser on a 403. It runs
+`browser-fetch.mjs` (Node.js + Playwright), which loads the URL in Chrome, Edge or
+Chromium, waits for the challenge to complete, and returns the page text. The
+fallback works on Windows, macOS and Linux and keeps its browser profile in
+`.browser-profile/` so the Cloudflare clearance cookie is reused between runs.
+
+Setup (only needed for the fallback):
+
+```powershell
+npm install
+```
+
+- **Windows/macOS:** an installed Chrome or Edge is used automatically; otherwise run
+  `npx playwright install chromium`.
+- **Linux/WSL:** Chromium needs system libraries. Install them once with
+  `sudo npx playwright install-deps chromium` (plus `npx playwright install chromium`
+  if no browser is installed). Without them the script prints a warning and continues
+  to fail with the normal 403 error.
+- `-Headed` shows the browser window, which is more reliable against Cloudflare.
+- `-NoBrowser` disables the fallback entirely.
+
+Status: the fallback has not yet been tested against a live challenge, because
+Cloudflare stopped challenging the script's plain requests while it was being built.
+This is automation of a site's bot protection, so check Cherry Collectables' terms,
+keep request volume low, and consider asking them for an official feed or allowlisting.
 
 ## Requirements
 
 - PowerShell 7.0 or later (`pwsh`)
 - Internet access to `cherrycollectables.com.au`
 - Recommended: `curl.exe` / `curl` 7.66 or newer (included with Windows 10/11 and Linux)
+- Optional, for the Cloudflare browser fallback: Node.js 18+ and `npm install`
 
 ## Usage
 

@@ -1,0 +1,9 @@
+{
+  "name": "cherry-break-watcher",
+  "private": true,
+  "type": "module",
+  "description": "Browser helper used by the PowerShell watcher to get past Cloudflare challenges",
+  "dependencies": {
+    "playwright-core": "^1.50.0"
+  }
+}
