@@ -63,6 +63,9 @@ param(
     # Never fall back to the real-browser helper when Cloudflare challenges a request
     [switch]$NoBrowser,
 
+    # Send every request through the real-browser helper instead of curl
+    [switch]$UseBrowser,
+
     # Show the browser window when the fallback runs (more reliable against Cloudflare)
     [switch]$Headed
 )
@@ -551,6 +554,10 @@ function Invoke-CherryRequest {
         [ValidateRange(1, 10)]
         [int]$MaximumAttempts = 3
     )
+
+    if ($UseBrowser -and -not $NoBrowser) {
+        return Invoke-CherryBrowserRequest -Uri $Uri
+    }
 
     $curlCommand = Get-NativeCurlCommand
 
