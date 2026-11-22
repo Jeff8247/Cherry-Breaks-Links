@@ -14,7 +14,8 @@ clean, ready-to-share break lines.
 - Can filter to daily and/or weekly breaks with spots left and send one Twitch
   chat message per matching break.
 - Recognises weekly breaks named like `Machos`, `Spenda`, `Punterz`,
-  `Sluggerz`, and `Amigos`, including loose singular/plural variants.
+  `Sluggerz`, and `Amigos`, including loose singular/plural variants (while
+  `Lil Punterz` stays in `Dailies`).
 - When `-Weeklies` is used, weekly breaks are searched from the broader
   group-break listings instead of only the selected weekday.
 - Can produce YouTube-friendly break lines capped at 200 characters while
@@ -35,10 +36,10 @@ Immaculate Baseball ⚾ (28 spots) #32929 - RT -> https://www.cherrycollectables
 ## Script
 
 `Watch-CherryBreaks-FullDescription-PS7.ps1` is the recommended script for PowerShell 7+. It
-loads the collection from Shopify's `products.json` first (about one request per
-collection, up to 250 products each), which also supplies every product's title
-and availability, so it needs no per-product requests. It uses native curl and
-lightweight HTTP requests to avoid Cloudflare bot detection and rate limits.
+loads the collection from Shopify's `products.json` (about one request per 250
+products, which also supplies every product's title and availability so it needs no
+per-product requests) using a real browser by default to pass Cloudflare challenges,
+or native `curl` / `Invoke-WebRequest` when `-NoBrowser` is used.
 
 The original `Watch-CherryBreaks-FullDescription.ps1` is also kept for Windows PowerShell 5.1. It uses the
 HTML collection pages and has no 429 handling.
@@ -65,15 +66,18 @@ browser does not avoid.
 By default the script loads every request in a real browser, which passes the
 challenge. Nothing has to be installed on Windows 11:
 
-1. **System Edge/Chrome (no install).** The script runs the Edge or Chrome already on
-   the machine headless (`--dump-dom`), waits for the challenge to finish, and reads
-   the JSON from the page. A profile is kept in `.browser-profile/native` beside the
-   script so Cloudflare's clearance cookie is reused. Verified working on Windows 11
-   with Edge.
-2. **Node + Playwright (optional).** If Node.js 18+ is installed and `npm install` has
-   been run in the script folder, `browser-fetch.mjs` is used instead. It also works
-   on macOS and Linux, and it supports `-Headed`. If no Chrome/Edge is installed,
-   download Playwright's browser with
+1. **System Edge/Chrome (no install).** The script runs the Edge or Chrome already
+   on the machine headless (`--dump-dom`), waits for the challenge to finish, and
+   reads the JSON from the page. A profile is kept in `.browser-profile/native`
+   beside the script so Cloudflare's clearance cookie is reused. Verified working on
+   Windows 11 with Edge.
+2. **Node + Playwright (optional).** If Node.js 20+ is installed and `npm install`
+   has been run in the script folder, `Watch-CherryBreaks-FullDescription-PS7.ps1`
+   runs an embedded single-session Playwright paginator directly (fetching all
+   collection pages in one browser session and reusing `.browser-profile` cookies,
+   with no separate `browser-fetch.mjs` process per page). It also works on macOS
+   and Linux, and it supports `-Headed`. If no Chrome/Edge is installed, download
+   Playwright's browser with
    `npx playwright-core install chromium-headless-shell` (no sudo; verified in WSL).
    Only if it then fails to start on Linux, run
    `sudo npx playwright install-deps chromium`.
@@ -111,7 +115,7 @@ Run it from PowerShell 7 (`pwsh`), not Windows PowerShell 5.1.
 - PowerShell 7.0 or later (`pwsh`)
 - Internet access to `cherrycollectables.com.au`
 - Recommended: `curl.exe` / `curl` 7.66 or newer (included with Windows 10/11 and Linux)
-- For the Cloudflare browser fallback: Microsoft Edge or Google Chrome (Edge is built into Windows 11). Node.js 18+ and `npm install` are optional.
+- For the Cloudflare browser fallback: Microsoft Edge or Google Chrome (Edge is built into Windows 11). Node.js 20+ and `npm install` are optional.
 
 ## Usage
 
@@ -238,11 +242,12 @@ Send only weekly breaks with spots left to Twitch chat:
 If `-Twitch` is used without `-Dailies` or `-Weeklies`, Twitch posting keeps
 the legacy daily-only behavior.
 
-The script sends one chat message per matching break and waits 2 seconds
-between messages by default. You can change that delay:
+The script sends one chat message per matching break over TLS-verified Twitch IRC
+(`irc.chat.twitch.tv:6697`) and waits 3 seconds between messages by default. You can
+change that delay:
 
 ```powershell
-.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday -Dailies -Weeklies -Twitch -TwitchMessageDelaySeconds 3
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday -Dailies -Weeklies -Twitch -TwitchMessageDelaySeconds 5
 ```
 
 The Twitch sender prints whether Twitch IRC accepted the login and confirmed
