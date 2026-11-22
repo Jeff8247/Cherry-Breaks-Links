@@ -1002,9 +1002,440 @@ function Get-CollectionProductsViaPlaywright {
     return $products.ToArray()
 }
 
+function Get-FreeTcpPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    try {
+        $listener.Start()
+        return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+    }
+    finally {
+        $listener.Stop()
+    }
+}
+
+function Invoke-CdpCommand {
+    param(
+        [Parameter(Mandatory)]
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+
+        [Parameter(Mandatory)]
+        [int]$CommandId,
+
+        [Parameter(Mandatory)]
+        [string]$Method,
+
+        [hashtable]$Params = @{},
+
+        [ValidateRange(500, 120000)]
+        [int]$TimeoutMilliseconds = 30000
+    )
+
+    $cts = [System.Threading.CancellationTokenSource]::new($TimeoutMilliseconds)
+    try {
+        $payload = @{
+            id     = $CommandId
+            method = $Method
+            params = $Params
+        } | ConvertTo-Json -Depth 10 -Compress
+
+        $sendBytes = $script:Utf8NoBom.GetBytes($payload)
+        $sendSegment = [System.ArraySegment[byte]]::new($sendBytes)
+        $null = $Socket.SendAsync(
+            $sendSegment,
+            [System.Net.WebSockets.WebSocketMessageType]::Text,
+            $true,
+            $cts.Token
+        ).GetAwaiter().GetResult()
+
+        $buffer = [byte[]]::new(65536)
+        $recvSegment = [System.ArraySegment[byte]]::new($buffer)
+
+        while ($true) {
+            $ms = [System.IO.MemoryStream]::new()
+            $message = ''
+            try {
+                do {
+                    $result = $Socket.ReceiveAsync($recvSegment, $cts.Token).GetAwaiter().GetResult()
+                    if ($result.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) {
+                        throw 'Browser closed the DevTools WebSocket connection.'
+                    }
+                    if ($result.Count -gt 0) {
+                        $ms.Write($buffer, 0, $result.Count)
+                    }
+                } until ($result.EndOfMessage)
+
+                $message = $script:Utf8NoBom.GetString($ms.GetBuffer(), 0, [int]$ms.Length)
+            }
+            finally {
+                $ms.Dispose()
+            }
+
+            if (-not $message) {
+                continue
+            }
+
+            $doc = [System.Text.Json.JsonDocument]::Parse($message)
+            try {
+                $root = $doc.RootElement
+                $idEl = [System.Text.Json.JsonElement]::new()
+                $recvId = 0
+
+                if (-not $root.TryGetProperty('id', [ref]$idEl) -or
+                    $idEl.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or
+                    -not $idEl.TryGetInt32([ref]$recvId) -or
+                    $recvId -ne $CommandId) {
+                    continue
+                }
+
+                $errEl = [System.Text.Json.JsonElement]::new()
+                if ($root.TryGetProperty('error', [ref]$errEl)) {
+                    $msgEl = [System.Text.Json.JsonElement]::new()
+                    $errMsg = if ($errEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Object -and
+                        $errEl.TryGetProperty('message', [ref]$msgEl) -and
+                        $msgEl.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+                        $msgEl.GetString()
+                    }
+                    else {
+                        $errEl.GetRawText()
+                    }
+                    throw "CDP '$Method' error: $errMsg"
+                }
+
+                $resEl = [System.Text.Json.JsonElement]::new()
+                if ($root.TryGetProperty('result', [ref]$resEl)) {
+                    return $resEl.GetRawText()
+                }
+                return ''
+            }
+            finally {
+                $doc.Dispose()
+            }
+        }
+    }
+    finally {
+        $cts.Dispose()
+    }
+}
+
+function Invoke-CdpEvaluateString {
+    param(
+        [Parameter(Mandatory)]
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+
+        [Parameter(Mandatory)]
+        [int]$CommandId,
+
+        [Parameter(Mandatory)]
+        [string]$Expression,
+
+        [switch]$AwaitPromise,
+
+        [ValidateRange(500, 120000)]
+        [int]$TimeoutMilliseconds = 30000
+    )
+
+    $resultJson = Invoke-CdpCommand `
+        -Socket $Socket `
+        -CommandId $CommandId `
+        -Method 'Runtime.evaluate' `
+        -Params @{
+            expression    = $Expression
+            returnByValue = $true
+            awaitPromise  = [bool]$AwaitPromise
+        } `
+        -TimeoutMilliseconds $TimeoutMilliseconds
+
+    if (-not $resultJson) {
+        return ''
+    }
+
+    $doc = [System.Text.Json.JsonDocument]::Parse($resultJson)
+    try {
+        $root = $doc.RootElement
+        $exEl = [System.Text.Json.JsonElement]::new()
+        if ($root.TryGetProperty('exceptionDetails', [ref]$exEl)) {
+            $desc = $exEl.GetRawText()
+            $innerEl = [System.Text.Json.JsonElement]::new()
+            $descEl = [System.Text.Json.JsonElement]::new()
+            if ($exEl.TryGetProperty('exception', [ref]$innerEl) -and
+                $innerEl.TryGetProperty('description', [ref]$descEl) -and
+                $descEl.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+                $desc = $descEl.GetString()
+            }
+            elseif ($exEl.TryGetProperty('text', [ref]$descEl) -and
+                $descEl.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+                $desc = $descEl.GetString()
+            }
+            throw "JavaScript evaluation error: $desc"
+        }
+
+        $resEl = [System.Text.Json.JsonElement]::new()
+        $valEl = [System.Text.Json.JsonElement]::new()
+        if ($root.TryGetProperty('result', [ref]$resEl) -and
+            $resEl.TryGetProperty('value', [ref]$valEl) -and
+            $valEl.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+            return $valEl.GetString()
+        }
+
+        return ''
+    }
+    finally {
+        $doc.Dispose()
+    }
+}
+
+function Start-NativeBrowserCdpProcess {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BrowserPath,
+
+        [Parameter(Mandatory)]
+        [string]$ProfileDir,
+
+        [Parameter(Mandatory)]
+        [int]$Port
+    )
+
+    $null = New-Item -ItemType Directory -Force -Path $ProfileDir
+
+    $browserArgs = [System.Collections.Generic.List[string]]::new()
+    $isHeadlessShell = [System.IO.Path]::GetFileNameWithoutExtension($BrowserPath) -like '*headless-shell*'
+    if (-not $Headed -and -not $isHeadlessShell) {
+        $browserArgs.Add('--headless=new')
+    }
+    $browserArgs.Add("--remote-debugging-port=$Port")
+    $browserArgs.Add('--remote-allow-origins=*')
+    $browserArgs.Add("--user-data-dir=$ProfileDir")
+    $browserArgs.Add('--no-first-run')
+    $browserArgs.Add('--no-default-browser-check')
+    $browserArgs.Add('--disable-background-mode')
+    $browserArgs.Add('--disable-gpu')
+    $browserArgs.Add('--disable-extensions')
+    if (-not $IsWindows) {
+        $browserArgs.Add('--no-sandbox')
+    }
+    $browserArgs.Add('about:blank')
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $BrowserPath
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = (-not $Headed)
+    if (-not $IsWindows) {
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+    }
+    foreach ($arg in $browserArgs) {
+        $psi.ArgumentList.Add($arg)
+    }
+
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+    if (-not $proc.Start()) {
+        $proc.Dispose()
+        return $null
+    }
+
+    if (-not $IsWindows) {
+        # Drain streams asynchronously on Unix so Chromium logs do not clutter output or fill pipe buffers.
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+    }
+
+    $deadline = [datetime]::UtcNow.AddSeconds(15)
+    $attempt = 0
+
+    while ([datetime]::UtcNow -lt $deadline) {
+        $attempt++
+        if ($proc.HasExited) {
+            $proc.Dispose()
+            return $null
+        }
+
+        try {
+            $targets = @(Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/list" -NoProxy -TimeoutSec 2)
+            $pageTarget = $targets |
+                Where-Object {
+                    $_.PSObject.Properties['type'] -and
+                    $_.type -eq 'page' -and
+                    $_.PSObject.Properties['webSocketDebuggerUrl'] -and
+                    $_.webSocketDebuggerUrl
+                } |
+                Select-Object -First 1
+
+            if ($pageTarget) {
+                return [pscustomobject]@{
+                    Process      = $proc
+                    WebSocketUrl = [string]$pageTarget.webSocketDebuggerUrl
+                }
+            }
+
+            if ($attempt -ge 10) {
+                $created = $null
+                try {
+                    $created = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/new?about:blank" -Method Put -NoProxy -TimeoutSec 2
+                }
+                catch {
+                    try {
+                        $created = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/new?about:blank" -Method Get -NoProxy -TimeoutSec 2
+                    }
+                    catch { }
+                }
+
+                if ($created -and $created.PSObject.Properties['webSocketDebuggerUrl'] -and $created.webSocketDebuggerUrl) {
+                    return [pscustomobject]@{
+                        Process      = $proc
+                        WebSocketUrl = [string]$created.webSocketDebuggerUrl
+                    }
+                }
+            }
+        }
+        catch { }
+
+        Start-Sleep -Milliseconds 200
+    }
+
+    try {
+        if (-not $proc.HasExited) {
+            try { $proc.Kill($true) } catch { try { $proc.Kill() } catch { } }
+        }
+    }
+    catch { }
+    finally {
+        $proc.Dispose()
+    }
+
+    return $null
+}
+
+function Read-CdpPageBody {
+    param(
+        [Parameter(Mandatory)]
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+
+        [Parameter(Mandatory)]
+        [ref]$CommandIdRef,
+
+        [Parameter(Mandatory)]
+        [string]$Url,
+
+        [ValidateRange(5, 300)]
+        [int]$TimeoutSeconds = 60
+    )
+
+    $CommandIdRef.Value++
+    $null = Invoke-CdpCommand `
+        -Socket $Socket `
+        -CommandId $CommandIdRef.Value `
+        -Method 'Page.navigate' `
+        -Params @{ url = $Url }
+
+    $expr = 'JSON.stringify({ href: location.href, readyState: document.readyState, title: document.title || "", text: document.body ? document.body.innerText : "" })'
+    $start = [datetime]::UtcNow
+    $deadline = $start.AddSeconds($TimeoutSeconds)
+
+    $lastHref = ''
+    $lastTitle = '(none)'
+    $lastText = ''
+    $wasChallenged = $false
+
+    while ([datetime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        $raw = ''
+        try {
+            $CommandIdRef.Value++
+            $raw = Invoke-CdpEvaluateString `
+                -Socket $Socket `
+                -CommandId $CommandIdRef.Value `
+                -Expression $expr `
+                -TimeoutMilliseconds 10000
+        }
+        catch {
+            if ($Socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+                throw
+            }
+            Write-Verbose "CDP poll retry: $($_.Exception.Message)"
+            continue
+        }
+
+        if (-not $raw) {
+            continue
+        }
+
+        $doc = [System.Text.Json.JsonDocument]::Parse($raw)
+        try {
+            $root = $doc.RootElement
+            $prop = [System.Text.Json.JsonElement]::new()
+
+            $href = if ($root.TryGetProperty('href', [ref]$prop) -and $prop.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $prop.GetString() } else { '' }
+            $readyState = if ($root.TryGetProperty('readyState', [ref]$prop) -and $prop.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $prop.GetString() } else { '' }
+            $title = if ($root.TryGetProperty('title', [ref]$prop) -and $prop.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $prop.GetString() } else { '' }
+            $text = if ($root.TryGetProperty('text', [ref]$prop) -and $prop.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $prop.GetString() } else { '' }
+        }
+        finally {
+            $doc.Dispose()
+        }
+
+        $lastHref = $href
+        $lastTitle = if ($title) { $title } else { '(none)' }
+        $lastText = $text
+
+        if (-not $href -or $href -eq 'about:blank') {
+            continue
+        }
+
+        if ($title -match '(?i)Verifying|Just a moment|Attention Required') {
+            $wasChallenged = $true
+            continue
+        }
+
+        if ($text.TrimStart() -match '^[\{\[]') {
+            return $text
+        }
+
+        if ($readyState -eq 'loading') {
+            continue
+        }
+
+        $elapsed = ([datetime]::UtcNow - $start).TotalSeconds
+        if (-not $text.Trim() -and $elapsed -lt 10) {
+            continue
+        }
+
+        $wasChallenged = $false
+        break
+    }
+
+    if ($wasChallenged) {
+        throw (New-CherryRequestException `
+            -Kind 'Blocked' `
+            -StatusCode 403 `
+            -Message "Access blocked (HTTP 403) by '$Url'. The browser could not pass the Cloudflare challenge; try -Headed.")
+    }
+
+    if ($lastText -match 'Attention Required|Sorry, you have been blocked') {
+        throw (New-CherryRequestException `
+            -Kind 'Blocked' `
+            -StatusCode 403 `
+            -Message "Access blocked (HTTP 403) by '$Url'. Cloudflare WAF blocked the browser request.")
+    }
+
+    if ($lastText -match 'local_rate_limited|Too Many Requests') {
+        throw (New-CherryRequestException `
+            -Kind 'RateLimited' `
+            -StatusCode 429 `
+            -Message "Rate limited (HTTP 429) by '$Url'.")
+    }
+
+    $snippet = Get-BodySnippet -Text $lastText
+    throw (New-CherryRequestException `
+        -Kind 'HttpError' `
+        -Message "Browser fallback failed: '$Url' did not return JSON (url: '$lastHref'). Page title: '$lastTitle'. Text: $snippet")
+}
+
 function Get-CollectionProductsViaNativeBrowser {
     param(
-        [int]$MaximumPages = 10
+        [int]$MaximumPages = 10,
+        [int]$TimeoutSeconds = 60
     )
 
     $browser = Get-NativeBrowserPath
@@ -1014,114 +1445,149 @@ function Get-CollectionProductsViaNativeBrowser {
             -Message 'Browser fallback unavailable: no Edge or Chrome found.')
     }
 
-    $profileDir = Join-Path $PSScriptRoot '.browser-profile' 'native'
-    $null = New-Item -ItemType Directory -Force -Path $profileDir
+    $persistentProfileDir = Join-Path $PSScriptRoot '.browser-profile' 'native'
+    $activeProfileDir = $persistentProfileDir
+    $cleanupTempProfile = $false
 
+    $port = Get-FreeTcpPort
+    Write-Verbose "Starting system browser via CDP ($browser, port $port)."
+    $session = Start-NativeBrowserCdpProcess -BrowserPath $browser -ProfileDir $activeProfileDir -Port $port
+
+    if (-not $session) {
+        # Edge/Chrome may exit immediately if another running instance holds the profile lock;
+        # retry once with a fresh isolated profile directory.
+        $activeProfileDir = Join-Path ([System.IO.Path]::GetTempPath()) "cherry-browser-$([guid]::NewGuid().ToString('N'))"
+        $cleanupTempProfile = $true
+        $port = Get-FreeTcpPort
+        Write-Verbose "Persistent profile did not start CDP; retrying with isolated profile ($activeProfileDir, port $port)."
+        $session = Start-NativeBrowserCdpProcess -BrowserPath $browser -ProfileDir $activeProfileDir -Port $port
+    }
+
+    if (-not $session) {
+        if ($cleanupTempProfile -and (Test-Path -LiteralPath $activeProfileDir)) {
+            Remove-Item -LiteralPath $activeProfileDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        throw (New-CherryRequestException `
+            -Kind 'BrowserUnavailable' `
+            -Message "Browser fallback failed: could not connect to $browser DevTools endpoint.")
+    }
+
+    $proc = $session.Process
+    $ws = [System.Net.WebSockets.ClientWebSocket]::new()
+    $ws.Options.Proxy = $null
+    $cmdId = 0
     $allProducts = [System.Collections.Generic.List[object]]::new()
 
-    for ($page = 1; $page -le $MaximumPages; $page++) {
-        $pageUrl = "$($script:ProductsJsonBaseUrl)&page=$page"
-        Write-Verbose "Loading '$pageUrl' in $browser (headless)."
-
-        if ($IsWindows) {
-            # Edge/Chrome are GUI-subsystem programs on Windows; Start-Process -Wait with
-            # file redirection both waits for completion and captures stdout reliably.
-            $outFile = [System.IO.Path]::GetTempFileName()
-            $errFile = [System.IO.Path]::GetTempFileName()
-            try {
-                $browserArgs = @(
-                    '--headless=new',
-                    '--disable-gpu',
-                    '--no-first-run',
-                    '--no-default-browser-check',
-                    "--user-data-dir=`"$profileDir`"",
-                    '--virtual-time-budget=20000',
-                    '--dump-dom',
-                    "`"$pageUrl`""
-                )
-                $proc = Start-Process -FilePath $browser -ArgumentList $browserArgs `
-                    -Wait -PassThru -NoNewWindow `
-                    -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-                $exitCode = if ($null -ne $proc) { $proc.ExitCode } else { 0 }
-                $dom = if (Test-Path -LiteralPath $outFile) {
-                    [System.IO.File]::ReadAllText($outFile, $script:Utf8NoBom)
-                }
-                else {
-                    ''
-                }
-                $errText = if (Test-Path -LiteralPath $errFile) {
-                    [System.IO.File]::ReadAllText($errFile, $script:Utf8NoBom)
-                }
-                else {
-                    ''
-                }
-            }
-            finally {
-                Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
-            }
+    try {
+        $connectCts = [System.Threading.CancellationTokenSource]::new(10000)
+        try {
+            $null = $ws.ConnectAsync([uri]$session.WebSocketUrl, $connectCts.Token).GetAwaiter().GetResult()
         }
-        else {
-            $browserArgs = @(
-                '--headless=new',
-                '--disable-gpu',
-                '--no-first-run',
-                '--no-default-browser-check',
-                "--user-data-dir=$profileDir",
-                '--virtual-time-budget=20000',
-                '--dump-dom',
-                $pageUrl
-            )
-            $procResult = Invoke-ExternalProcess `
-                -FilePath $browser `
-                -Arguments $browserArgs `
-                -TimeoutMilliseconds 60000
-            $exitCode = $procResult.ExitCode
-            $dom = if ($procResult.StdOut) { $procResult.StdOut } else { '' }
-            $errText = if ($procResult.StdErr) { $procResult.StdErr } else { '' }
+        finally {
+            $connectCts.Dispose()
         }
 
-        if (-not $dom.Trim()) {
-            $errSnippet = Get-BodySnippet -Text $errText
-            $errSuffix = if ($errSnippet) { " Stderr: $errSnippet" } else { '' }
-            throw (New-CherryRequestException `
-                -Kind 'BrowserUnavailable' `
-                -Message "Browser fallback failed (exit $exitCode): $browser produced no output.$errSuffix")
-        }
+        $cmdId++
+        $null = Invoke-CdpCommand -Socket $ws -CommandId $cmdId -Method 'Page.enable'
 
-        if ($dom -match '<title>[^<]*(Verifying|Just a moment|Attention Required)') {
-            throw (New-CherryRequestException `
-                -Kind 'Blocked' `
-                -StatusCode 403 `
-                -Message "Access blocked (HTTP 403) by '$pageUrl'. The headless browser could not pass the Cloudflare challenge.")
-        }
+        for ($page = 1; $page -le $MaximumPages; $page++) {
+            $pageUrl = "$($script:ProductsJsonBaseUrl)&page=$page"
+            Write-Verbose "Loading '$pageUrl' in $browser via CDP."
 
-        # Chromium renders a JSON response inside <pre>...</pre>; unwrap it.
-        $content = $dom
-        if ($dom -match '(?s)<pre[^>]*>(.*?)</pre>') {
-            $content = [System.Net.WebUtility]::HtmlDecode($Matches[1])
-        }
-
-        if ($content.TrimStart() -notmatch '^[\{\[]') {
-            $title = if ($dom -match '(?is)<title[^>]*>(.*?)</title>') {
-                ($Matches[1] -replace '\s+', ' ').Trim()
+            $content = $null
+            if ($page -eq 1) {
+                $content = Read-CdpPageBody `
+                    -Socket $ws `
+                    -CommandIdRef ([ref]$cmdId) `
+                    -Url $pageUrl `
+                    -TimeoutSeconds $TimeoutSeconds
             }
             else {
-                '(none)'
+                $escapedUrlJson = $pageUrl | ConvertTo-Json -Compress
+                $fetchExpr = "(async () => { const r = await fetch($escapedUrlJson, { credentials: 'include', headers: { Accept: 'application/json' } }); return JSON.stringify({ status: r.status, text: await r.text() }); })()"
+                $cmdId++
+                $fetchRaw = Invoke-CdpEvaluateString `
+                    -Socket $ws `
+                    -CommandId $cmdId `
+                    -Expression $fetchExpr `
+                    -AwaitPromise `
+                    -TimeoutMilliseconds ($TimeoutSeconds * 1000)
+
+                $fetchStatus = 0
+                $fetchText = ''
+                if ($fetchRaw) {
+                    $fDoc = [System.Text.Json.JsonDocument]::Parse($fetchRaw)
+                    try {
+                        $fRoot = $fDoc.RootElement
+                        $fProp = [System.Text.Json.JsonElement]::new()
+                        if ($fRoot.TryGetProperty('status', [ref]$fProp) -and $fProp.ValueKind -eq [System.Text.Json.JsonValueKind]::Number) {
+                            $null = $fProp.TryGetInt32([ref]$fetchStatus)
+                        }
+                        if ($fRoot.TryGetProperty('text', [ref]$fProp) -and $fProp.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+                            $fetchText = $fProp.GetString()
+                        }
+                    }
+                    finally {
+                        $fDoc.Dispose()
+                    }
+                }
+
+                if ($fetchStatus -eq 429) {
+                    throw (New-CherryRequestException -Kind 'RateLimited' -StatusCode 429 -Message "Rate limited (HTTP 429) by '$pageUrl'.")
+                }
+                elseif ($fetchStatus -eq 403 -or $fetchText.TrimStart() -notmatch '^[\{\[]') {
+                    $content = Read-CdpPageBody `
+                        -Socket $ws `
+                        -CommandIdRef ([ref]$cmdId) `
+                        -Url $pageUrl `
+                        -TimeoutSeconds $TimeoutSeconds
+                }
+                elseif ($fetchStatus -ge 400) {
+                    throw (New-CherryRequestException -Kind 'HttpError' -StatusCode $fetchStatus -Message "HTTP $fetchStatus returned by '$pageUrl'.")
+                }
+                else {
+                    $content = $fetchText
+                }
             }
-            $plainText = ($dom -replace '(?is)<(script|style)[^>]*>.*?</\1>', ' ' -replace '<[^>]+>', ' ')
-            $snippet = Get-BodySnippet -Text $plainText
-            throw (New-CherryRequestException `
-                -Kind 'HttpError' `
-                -Message "Browser fallback failed: '$pageUrl' did not return JSON. Page title: '$title'. Text: $snippet")
+
+            $parsed = ConvertFrom-ProductsJson -JsonText $content -SourceUrl $pageUrl
+            foreach ($p in $parsed.Products) {
+                $allProducts.Add($p)
+            }
+
+            if ($parsed.RawCount -lt 250) {
+                break
+            }
+        }
+    }
+    finally {
+        if ($null -ne $ws) {
+            if ($ws.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
+                try {
+                    $cmdId++
+                    $null = Invoke-CdpCommand -Socket $ws -CommandId $cmdId -Method 'Browser.close' -TimeoutMilliseconds 2000
+                }
+                catch { }
+            }
+            $ws.Dispose()
         }
 
-        $parsed = ConvertFrom-ProductsJson -JsonText $content -SourceUrl $pageUrl
-        foreach ($p in $parsed.Products) {
-            $allProducts.Add($p)
+        if ($null -ne $proc) {
+            try {
+                if (-not $proc.HasExited) {
+                    if (-not $proc.WaitForExit(3000)) {
+                        try { $proc.Kill($true) } catch { try { $proc.Kill() } catch { } }
+                    }
+                }
+            }
+            catch { }
+            finally {
+                $proc.Dispose()
+            }
         }
 
-        if ($parsed.RawCount -lt 250) {
-            break
+        if ($cleanupTempProfile -and $activeProfileDir -and (Test-Path -LiteralPath $activeProfileDir)) {
+            Remove-Item -LiteralPath $activeProfileDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
@@ -2128,7 +2594,7 @@ function Send-TwitchChatMessages {
         if (-not $connectTask.Wait(10000)) {
             throw 'Timed out connecting to Twitch IRC (irc.chat.twitch.tv:6697).'
         }
-        $connectTask.GetAwaiter().GetResult()
+        $null = $connectTask.GetAwaiter().GetResult()
 
         $sslStream = [System.Net.Security.SslStream]::new($tcpClient.GetStream(), $false)
         $sslStream.AuthenticateAsClient('irc.chat.twitch.tv')
