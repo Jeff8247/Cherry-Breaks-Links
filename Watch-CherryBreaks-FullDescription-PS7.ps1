@@ -4,14 +4,15 @@
 Checks Cherry Collectables group breaks and prints full-description
 lines in this format:
 
-SPOTS LEFT | BREAK NUMBER | DESCRIPTION | URL
+DESCRIPTION | SPORT EMOJI | SPOTS | BREAK NUMBER | ALLOCATION | -> URL
 
 By default, the script checks today's Sydney day. Use -Day to check the
 next matching weekday instead.
 
-Requires PowerShell 7.0 or later. Uses Shopify products.json as the
-primary data source with native curl / lightweight HTTP requests to avoid
-Cloudflare bot detection and rate limits.
+Requires PowerShell 7.0 or later. Uses Shopify products.json via a real
+browser by default (Node + Playwright when installed, otherwise system
+Edge/Chrome headless) to pass Cloudflare challenges, or curl /
+Invoke-WebRequest when -NoBrowser is specified.
 
 Examples:
 
@@ -21,6 +22,7 @@ Examples:
 .\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Friday -YouTube
 .\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Friday -Dailies -Twitch
 .\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Friday -Dailies -Weeklies -Twitch
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Friday -NoBrowser
 
 -OutputPath overwrites the text file every run.
 #>
@@ -66,25 +68,155 @@ param(
     # Kept for compatibility: the real browser is now the default for every request
     [switch]$UseBrowser,
 
-    # Show the browser window when the fallback runs (more reliable against Cloudflare)
+    # Show the browser window when the Playwright browser runs (more reliable against Cloudflare)
     [switch]$Headed
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
 $DayWasExplicitlyRequested = $PSBoundParameters.ContainsKey('Day')
 
-$BaseUrl = 'https://www.cherrycollectables.com.au'
-$CollectionPath = '/collections/card-breaks'
+#region Constants & Precompiled Rules
 
-$Headers = @{
+$script:BaseUrl = 'https://www.cherrycollectables.com.au'
+$script:CollectionPath = '/collections/card-breaks'
+$script:ProductsJsonBaseUrl = "$($script:BaseUrl)$($script:CollectionPath)/products.json?limit=250"
+$script:Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+$script:Headers = @{
     'User-Agent' = 'Mozilla/5.0 (compatible; CherryBreakWatcher/1.0)'
     'Accept'     = 'application/json, */*'
 }
 
-$ProductJsonCache = @{}
-$CollectionJsonLoaded = @{}
+$script:SydneyTimeZone = try {
+    [TimeZoneInfo]::FindSystemTimeZoneById('Australia/Sydney')
+}
+catch {
+    [TimeZoneInfo]::FindSystemTimeZoneById('AUS Eastern Standard Time')
+}
+
+$script:SydneyNow = [TimeZoneInfo]::ConvertTimeFromUtc(
+    [datetime]::UtcNow,
+    $script:SydneyTimeZone
+)
+
+$script:MonthNumbers = @{
+    jan       = 1; january   = 1
+    feb       = 2; february  = 2
+    mar       = 3; march     = 3
+    apr       = 4; april     = 4
+    may       = 5
+    jun       = 6; june      = 6
+    jul       = 7; july      = 7
+    aug       = 8; august    = 8
+    sep       = 9; sept      = 9; september = 9
+    oct       = 10; october  = 10
+    nov       = 11; november = 11
+    dec       = 12; december = 12
+}
+
+$script:RegexIgnoreCaseCompiled = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+    [System.Text.RegularExpressions.RegexOptions]::Compiled
+$script:RegexCompiled = [System.Text.RegularExpressions.RegexOptions]::Compiled
+
+$monthsRegexPart = 'Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?'
+$timeRegexPart = '\d{1,2}(?::\d{2})?\s*(?:am|pm)'
+$middleDotEscaped = [regex]::Escape([string][char]0x30FB)
+$separatorChars = '\-\|' + $middleDotEscaped +
+    [regex]::Escape([string][char]0x2013) +
+    [regex]::Escape([string][char]0x2014)
+
+$script:MonthDayRegex = [regex]::new(
+    "(?:^|[-_/\s(])(?<month>$monthsRegexPart)[-_/\s]+(?<day>\d{1,2})(?:st|nd|rd|th)?(?:[-_/\s),]|$)",
+    $script:RegexIgnoreCaseCompiled
+)
+$script:DayMonthRegex = [regex]::new(
+    "(?:^|[-_/\s(])(?<day>\d{1,2})(?:st|nd|rd|th)?[-_/\s]+(?:of[-_/\s]+)?(?<month>$monthsRegexPart)(?:[-_/\s),]|$)",
+    $script:RegexIgnoreCaseCompiled
+)
+
+# "Lil Punterz" is a daily break; standalone "Punterz" is treated as weekly.
+$script:DailyBreakNameRegex = [regex]::new(
+    '\b(?<lil>Lil\s+)?(?<name>Punterz|Teamz|Squadz|Derby|Slapperz)\b',
+    $script:RegexIgnoreCaseCompiled
+)
+$script:WeeklyBreakNameRegex = [regex]::new(
+    '\b(?<name>Machos?|Spenda(?:s|z)?|(?<!\bLil\s+)Punterz?|Slugger(?:s|z)?|Amigos?)\b',
+    $script:RegexIgnoreCaseCompiled
+)
+$script:BreakNumberRegex = [regex]::new('#(?<number>\d+)', $script:RegexCompiled)
+
+$script:DateRemovalRegexes = @(
+    [regex]::new('\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b', $script:RegexIgnoreCaseCompiled)
+    [regex]::new("\(\s*(?:(?:$monthsRegexPart)\s+\d{1,2}(?:st|nd|rd|th)?|\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:$monthsRegexPart))(?:,?\s+20\d{2})?(?:\s*(?:@|at|-)?\s*$timeRegexPart)?\s*\)", $script:RegexIgnoreCaseCompiled)
+    [regex]::new("\b(?:$monthsRegexPart)\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+20\d{2})?(?:\s*(?:@|at|-)?\s*$timeRegexPart)?\b", $script:RegexIgnoreCaseCompiled)
+    [regex]::new("\b\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:$monthsRegexPart)(?:,?\s+20\d{2})?(?:\s*(?:@|at|-)?\s*$timeRegexPart)?\b", $script:RegexIgnoreCaseCompiled)
+    [regex]::new('(?<!\d)20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}(?!\d)', $script:RegexCompiled)
+    [regex]::new('(?<!\d)\d{1,2}[-/.]\d{1,2}(?:[-/.](?:20)?\d{2})?(?!\d)', $script:RegexCompiled)
+    [regex]::new('\b20\d{2}(?:[-/]\d{2,4})?\b', $script:RegexIgnoreCaseCompiled)
+)
+
+$script:AllocationRules = @(
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:Random\s+Teams?|RT)\b', $script:RegexIgnoreCaseCompiled); Suffix = ' - RT' }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:Random\s+Wrestlers?|RW)\b', $script:RegexIgnoreCaseCompiled); Suffix = ' - RW' }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:Random\s+Spots?|RS)\b', $script:RegexIgnoreCaseCompiled); Suffix = ' - RS' }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:Random\s+Colou?rs?|RC)\b', $script:RegexIgnoreCaseCompiled); Suffix = ' - RC' }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:Random\s+Players?|RP)\b', $script:RegexIgnoreCaseCompiled); Suffix = ' - RP' }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:Random\s+Packs?|RPk)\b', $script:RegexIgnoreCaseCompiled); Suffix = ' - RPk' }
+)
+
+$script:DescriptionStripRegex = [regex]::new(
+    '#\d+|\b(?:Wrestler\s+Team\s+Based|Team\s+Based|Pick\s+Your\s+Wrestlers?|PYW|Pick\s+Your\s+Players?|PYP|Pick\s+Your\s+Teams?|PYT|Random\s+Teams?|RT|Random\s+Wrestlers?|RW|Random\s+Spots?|RS|Random\s+Colou?rs?|RC|Random\s+Players?|RP|Random\s+Packs?|RPk|Random\s+Types?|Types?|Random\s+Characters?|Random\s+Wreslet|Opening)\b',
+    $script:RegexIgnoreCaseCompiled
+)
+$script:SingleBoxRegex = [regex]::new('\b1\s*-?\s*Box(?:es)?\b', $script:RegexIgnoreCaseCompiled)
+$script:MultiBoxRegex = [regex]::new('\b(?<count>\d+)\s*-?\s*Box(?:es)?\b', $script:RegexIgnoreCaseCompiled)
+$script:MiddleDotRegex = [regex]::new("\s*$middleDotEscaped\s*", $script:RegexCompiled)
+$script:TrailingSeparatorRegex = [regex]::new("[\s\p{Zs}]*[$separatorChars]+(?:[\s\p{Zs}]*[$separatorChars]+)*[\s\p{Zs}]*$", $script:RegexCompiled)
+$script:LeadingSeparatorRegex = [regex]::new("^[\s\p{Zs}]*[$separatorChars]+(?:[\s\p{Zs}]*[$separatorChars]+)*[\s\p{Zs}]*", $script:RegexCompiled)
+$script:MultiWhitespaceRegex = [regex]::new('\s+', $script:RegexCompiled)
+
+$script:NormalizePresidentRegex = [regex]::new("\s+[$separatorChars]+\s*$middleDotEscaped\s*(?=Random\s+President\b)", $script:RegexCompiled)
+$script:NormalizeSepDotRegex = [regex]::new("\s+[$separatorChars]+\s*$middleDotEscaped\s*", $script:RegexCompiled)
+$script:NormalizeBeforeSpotsRegex = [regex]::new("\s+[$separatorChars]+\s+(?=(?:\S+\s+)?\((?:\?|\d+)\s+spots?(?:\s+left)?\))", $script:RegexCompiled)
+$script:MultiSpaceRegex = [regex]::new('\s{2,}', $script:RegexCompiled)
+
+$emojiFootball = [char]::ConvertFromUtf32(0x1F3C8)
+$emojiBasketball = [char]::ConvertFromUtf32(0x1F3C0)
+$emojiBaseball = [char]::ConvertFromUtf32(0x26BE)
+$emojiHockey = [char]::ConvertFromUtf32(0x1F3D2)
+$emojiSoccer = [char]::ConvertFromUtf32(0x26BD)
+$emojiTennis = [char]::ConvertFromUtf32(0x1F3BE)
+$emojiWrestling = [char]::ConvertFromUtf32(0x1F93C) + [char]::ConvertFromUtf32(0x200D) +
+    [char]::ConvertFromUtf32(0x2642) + [char]::ConvertFromUtf32(0xFE0F)
+
+# Order matters: daily names take precedence, and soccer precedes Topps/MLB/Bowman.
+$script:SportEmojiRules = @(
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:Lil\s+)?(?:Punterz|Squadz)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiFootball }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:Lil\s+)?Teamz\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiBasketball }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:Lil\s+)?Derby\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiBaseball }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:Lil\s+)?Slapperz\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiHockey }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:Soccer|EPL|UCL|UEFA|FIFA|Premier League|Champions League|La Liga|LaLiga|Bundesliga|Serie A|Ligue 1|MLS|World Cup|Euro 20\d{2})\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiSoccer }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:NBA|Basketball)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiBasketball }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:NFL|American Football|Gridiron)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiFootball }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:NHL|Hockey)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiHockey }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:Tennis|ATP|WTA)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiTennis }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:WWE|AEW|MLW|Wrestling|Wrestler|Wrestlers)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiWrestling }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:MLB|Baseball|Bowman)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiBaseball }
+)
+
+$script:CachedCurlPath = $null
+$script:CurlPathResolved = $false
+$script:CachedNodePath = $null
+$script:NodePathResolved = $false
+$script:CachedBrowserPath = $null
+$script:BrowserPathResolved = $false
+
+#endregion
+
+#region Configuration & .env Helpers
 
 function Resolve-ScriptRelativePath {
     param(
@@ -108,8 +240,8 @@ function ConvertFrom-DotEnvValue {
     $trimmed = $Value.Trim()
 
     if ($trimmed.Length -ge 2) {
-        $first = $trimmed.Substring(0, 1)
-        $last = $trimmed.Substring($trimmed.Length - 1, 1)
+        $first = $trimmed[0]
+        $last = $trimmed[$trimmed.Length - 1]
 
         if (($first -eq '"' -and $last -eq '"') -or
             ($first -eq "'" -and $last -eq "'")) {
@@ -149,9 +281,7 @@ function Import-DotEnvFile {
             continue
         }
 
-        $name = $match.Groups['name'].Value
-        $value = ConvertFrom-DotEnvValue -Value $match.Groups['value'].Value
-        $values[$name] = $value
+        $values[$match.Groups['name'].Value] = ConvertFrom-DotEnvValue -Value $match.Groups['value'].Value
     }
 
     return $values
@@ -179,7 +309,6 @@ function Get-ConfigValue {
         }
 
         $environmentValue = [Environment]::GetEnvironmentVariable($name)
-
         if ($environmentValue) {
             return $environmentValue
         }
@@ -189,562 +318,944 @@ function Get-ConfigValue {
 }
 
 $DotEnvValues = Import-DotEnvFile -Path $EnvPath
-$TwitchChannel = Get-ConfigValue `
-    -CurrentValue $TwitchChannel `
-    -DotEnvValues $DotEnvValues `
-    -Names @('TWITCH_CHANNEL')
-$TwitchUser = Get-ConfigValue `
-    -CurrentValue $TwitchUser `
-    -DotEnvValues $DotEnvValues `
-    -Names @('TWITCH_USER', 'TWITCH_BOT_USER')
-$TwitchOAuthToken = Get-ConfigValue `
-    -CurrentValue $TwitchOAuthToken `
-    -DotEnvValues $DotEnvValues `
-    -Names @('TWITCH_OAUTH_TOKEN')
+$TwitchChannel = Get-ConfigValue -CurrentValue $TwitchChannel -DotEnvValues $DotEnvValues -Names @('TWITCH_CHANNEL')
+$TwitchUser = Get-ConfigValue -CurrentValue $TwitchUser -DotEnvValues $DotEnvValues -Names @('TWITCH_USER', 'TWITCH_BOT_USER')
+$TwitchOAuthToken = Get-ConfigValue -CurrentValue $TwitchOAuthToken -DotEnvValues $DotEnvValues -Names @('TWITCH_OAUTH_TOKEN')
 
-function Get-SydneyDate {
-    $timeZone = try {
-        [TimeZoneInfo]::FindSystemTimeZoneById('Australia/Sydney')
-    }
-    catch {
-        [TimeZoneInfo]::FindSystemTimeZoneById('AUS Eastern Standard Time')
-    }
+#endregion
 
-    return [TimeZoneInfo]::ConvertTimeFromUtc(
-        [datetime]::UtcNow,
-        $timeZone
-    )
-}
+#region Process, Diagnostics & Error Helpers
 
-function Get-TargetDay {
-    param(
-        [string]$RequestedDay
-    )
-
-    if ($RequestedDay) {
-        return $RequestedDay
-    }
-
-    return (Get-SydneyDate).DayOfWeek.ToString()
-}
-
-function Get-TargetDate {
+function New-CherryRequestException {
     param(
         [Parameter(Mandatory)]
-        [string]$Day
+        [string]$Message,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('RateLimited', 'Blocked', 'BrowserUnavailable', 'HttpError')]
+        [string]$Kind,
+
+        [int]$StatusCode = 0
     )
 
-    $today = (Get-SydneyDate).Date
-    $targetDayOfWeek = [System.DayOfWeek]::$Day
-    $daysUntilTarget = ([int]$targetDayOfWeek - [int]$today.DayOfWeek + 7) % 7
-
-    return $today.AddDays($daysUntilTarget)
+    $ex = [System.Exception]::new($Message)
+    $ex.Data['Kind'] = $Kind
+    $ex.Data['StatusCode'] = $StatusCode
+    return $ex
 }
 
-function Get-UnfilteredCollectionUrl {
-    return "$BaseUrl${CollectionPath}?sort=creation_date"
+function Get-ExceptionKind {
+    param(
+        [System.Exception]$Exception
+    )
+
+    if ($Exception -and $Exception.Data -and $Exception.Data.Contains('Kind')) {
+        return [string]$Exception.Data['Kind']
+    }
+
+    return $null
 }
 
-function Get-TextBreakDate {
+function Get-BodySnippet {
+    param(
+        [AllowNull()]
+        [string]$Text,
+
+        [int]$MaxLength = 300
+    )
+
+    if (-not $Text) {
+        return ''
+    }
+
+    $snippet = ($Text -replace '\s+', ' ').Trim()
+    if ($snippet.Length -gt $MaxLength) {
+        return $snippet.Substring(0, $MaxLength) + '...'
+    }
+
+    return $snippet
+}
+
+function Invoke-ExternalProcess {
     param(
         [Parameter(Mandatory)]
-        [string]$Text
+        [string]$FilePath,
+
+        [string[]]$Arguments = @(),
+
+        [AllowNull()]
+        [string]$StandardInput = $null,
+
+        [ValidateRange(1000, 600000)]
+        [int]$TimeoutMilliseconds = 60000
     )
 
-    $monthNumbers = @{
-        jan  = 1
-        feb  = 2
-        mar  = 3
-        apr  = 4
-        may  = 5
-        jun  = 6
-        jul  = 7
-        aug  = 8
-        sep  = 9
-        sept = 9
-        oct  = 10
-        nov  = 11
-        dec  = 12
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $FilePath
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = $script:Utf8NoBom
+    $psi.StandardErrorEncoding = $script:Utf8NoBom
+
+    if ($null -ne $StandardInput) {
+        $psi.RedirectStandardInput = $true
     }
 
-    $match = [regex]::Match(
-        $Text,
-        '(?i)(?:^|[-_/\s(])(?<month>jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[-_/\s]+(?<day>\d{1,2})(?:[-_/\s)]|$)'
-    )
-
-    if (-not $match.Success) {
-        return $null
+    foreach ($arg in $Arguments) {
+        $psi.ArgumentList.Add($arg)
     }
 
-    $monthName = $match.Groups['month'].Value.ToLowerInvariant()
-    $month = $monthNumbers[$monthName]
-    $dayOfMonth = [int]$match.Groups['day'].Value
-    $sydneyDate = Get-SydneyDate
-    $year = $sydneyDate.Year
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $psi
 
     try {
-        $productDate = [datetime]::new($year, $month, $dayOfMonth)
-    }
-    catch {
-        return $null
-    }
+        if (-not $process.Start()) {
+            throw "Failed to start process '$FilePath'."
+        }
 
-    if ($productDate -lt $sydneyDate.Date.AddMonths(-6)) {
-        $productDate = $productDate.AddYears(1)
-    }
-    elseif ($productDate -gt $sydneyDate.Date.AddMonths(6)) {
-        $productDate = $productDate.AddYears(-1)
-    }
+        if ($null -ne $StandardInput) {
+            $inputBytes = $script:Utf8NoBom.GetBytes($StandardInput)
+            $process.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)
+            $process.StandardInput.BaseStream.Flush()
+            $process.StandardInput.Close()
+        }
 
-    return $productDate.Date
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            try {
+                $process.Kill($true)
+            }
+            catch {
+                try { $process.Kill() } catch { }
+            }
+            throw "Process '$FilePath' timed out after $([int]($TimeoutMilliseconds / 1000)) seconds."
+        }
+
+        # WaitForExit(int) can return before async stream buffers finish flushing.
+        $process.WaitForExit()
+
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            StdOut   = $stdoutTask.GetAwaiter().GetResult()
+            StdErr   = $stderrTask.GetAwaiter().GetResult()
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
 }
 
-function Get-TextDateDay {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Text
-    )
+function Get-NativeCurlPath {
+    if (-not $script:CurlPathResolved) {
+        $cmd = @(
+            Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue
+            Get-Command curl -CommandType Application -ErrorAction SilentlyContinue
+        ) | Select-Object -First 1
 
-    $productDate = Get-TextBreakDate -Text $Text
-
-    if (-not $productDate) {
-        return $null
+        $script:CachedCurlPath = if ($cmd) { $cmd.Source } else { $null }
+        $script:CurlPathResolved = $true
     }
 
-    return $productDate.DayOfWeek.ToString()
+    return $script:CachedCurlPath
 }
 
-function Test-ProductUrlMatchesDay {
-    param(
-        [Parameter(Mandatory)]
-        [string]$ProductUrl,
+function Get-NodePath {
+    if (-not $script:NodePathResolved) {
+        $cmd = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        $script:CachedNodePath = if ($cmd) { $cmd.Source } else { $null }
+        $script:NodePathResolved = $true
+    }
 
-        [Parameter(Mandatory)]
-        [string]$Day
-    )
-
-    $uri = [uri]$ProductUrl
-    $dateDay = Get-TextDateDay -Text $uri.AbsolutePath
-
-    return $dateDay -eq $Day
+    return $script:CachedNodePath
 }
 
-function Test-ProductMatchesDayFallback {
-    param(
-        [Parameter(Mandatory)]
-        [string]$ProductUrl,
+function Get-NativeBrowserPath {
+    if ($script:BrowserPathResolved) {
+        return $script:CachedBrowserPath
+    }
 
-        [Parameter(Mandatory)]
-        [string]$Day,
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA)) {
+        if ($root) {
+            $candidates.Add((Join-Path $root 'Microsoft\Edge\Application\msedge.exe'))
+            $candidates.Add((Join-Path $root 'Google\Chrome\Application\chrome.exe'))
+        }
+    }
+    $candidates.Add('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+    $candidates.Add('/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge')
 
-        [Parameter(Mandatory)]
-        [datetime]$TargetDate
-    )
-
-    $product = Get-ProductJson -ProductUrl $ProductUrl
-
-    if ($product) {
-        $titleDate = Get-TextBreakDate -Text $product.title
-
-        if ($titleDate) {
-            return $titleDate -eq $TargetDate.Date
+    foreach ($path in $candidates) {
+        if ($path -and (Test-Path -LiteralPath $path)) {
+            $script:CachedBrowserPath = $path
+            $script:BrowserPathResolved = $true
+            return $path
         }
     }
 
-    $uri = [uri]$ProductUrl
-    $urlDate = Get-TextBreakDate -Text $uri.AbsolutePath
-
-    if ($urlDate) {
-        return $urlDate -eq $TargetDate.Date
+    foreach ($name in 'microsoft-edge', 'google-chrome', 'chromium', 'chromium-browser') {
+        $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cmd) {
+            $script:CachedBrowserPath = $cmd.Source
+            $script:BrowserPathResolved = $true
+            return $cmd.Source
+        }
     }
 
-    return Test-ProductUrlMatchesDay -ProductUrl $ProductUrl -Day $Day
-}
-
-function Get-NativeCurlCommand {
-    $commands = @(
-        Get-Command curl.exe -ErrorAction SilentlyContinue
-        Get-Command curl -ErrorAction SilentlyContinue
-    )
-
-    return @(
-        $commands |
-            Where-Object { $_.CommandType -eq 'Application' }
-    ) | Select-Object -First 1
+    $script:BrowserPathResolved = $true
+    return $null
 }
 
 function Get-CherryBlockDiagnostics {
     # Summarises a blocked/rate-limited response so we can tell a Cloudflare
     # challenge from a Shopify rate limit or a plain WAF rule.
     param(
+        [AllowNull()]
         [string]$RawHeaders,
+
+        [AllowNull()]
         [string]$Body
     )
 
     $interesting = 'server|cf-ray|cf-mitigated|cf-cache-status|content-type|retry-after|x-shopify-stage|x-request-id|x-sorting-hat|set-cookie'
-    $lines = @()
+    $lines = [System.Collections.Generic.List[string]]::new()
 
     if ($RawHeaders) {
-        # curl --dump-header may hold several blocks (redirects); keep the last one
-        $blocks = @($RawHeaders -split "(?:\r?\n){2,}" | Where-Object { $_.Trim() })
+        # curl --dump-header may hold several blocks (redirects); keep the last one.
+        $blocks = @($RawHeaders -split '(?:\r?\n){2,}' | Where-Object { $_.Trim() })
         if ($blocks.Count -gt 0) {
-            foreach ($line in ($blocks[-1] -split "\r?\n")) {
-                if ($line -match '^HTTP/' -or $line -match "^($interesting):") {
-                    # Don't print cookie values, only their names
-                    if ($line -match '^set-cookie:\s*([^=]+)=') { $line = "set-cookie: $($Matches[1])=<redacted>" }
-                    $lines += "    $line"
+            foreach ($line in ($blocks[-1] -split '\r?\n')) {
+                if ($line -match '^HTTP/' -or $line -match "^(?i)($interesting):") {
+                    if ($line -match '^(?i)set-cookie:\s*([^=]+)=') {
+                        $line = "set-cookie: $($Matches[1])=<redacted>"
+                    }
+                    $lines.Add("    $line")
                 }
             }
         }
     }
 
     $hint = ''
-    if ($RawHeaders -match '(?im)^cf-mitigated:\s*challenge') { $hint = 'Cloudflare managed challenge (needs a real browser).' }
-    elseif ($RawHeaders -match '(?im)^server:\s*cloudflare' -and $Body -match 'Just a moment|cf-chl|challenge-platform') { $hint = 'Cloudflare interstitial challenge page.' }
-    elseif ($RawHeaders -match '(?im)^server:\s*cloudflare' -and $Body -match 'Attention Required|Sorry, you have been blocked') { $hint = 'Cloudflare WAF block page.' }
-    elseif ($RawHeaders -match '(?im)^x-shopify-stage|^x-sorting-hat') { $hint = 'Served by Shopify directly (not a Cloudflare challenge).' }
-
-    $snippet = ''
-    if ($Body) {
-        $snippet = ($Body -replace '\s+', ' ')
-        if ($snippet.Length -gt 300) { $snippet = $snippet.Substring(0, 300) + '...' }
+    if ($RawHeaders -match '(?im)^cf-mitigated:\s*challenge') {
+        $hint = 'Cloudflare managed challenge (needs a real browser).'
+    }
+    elseif ($RawHeaders -match '(?im)^server:\s*cloudflare' -and $Body -match 'Just a moment|cf-chl|challenge-platform') {
+        $hint = 'Cloudflare interstitial challenge page.'
+    }
+    elseif ($RawHeaders -match '(?im)^server:\s*cloudflare' -and $Body -match 'Attention Required|Sorry, you have been blocked') {
+        $hint = 'Cloudflare WAF block page.'
+    }
+    elseif ($RawHeaders -match '(?im)^x-shopify-stage|^x-sorting-hat') {
+        $hint = 'Served by Shopify directly (not a Cloudflare challenge).'
     }
 
+    $snippet = Get-BodySnippet -Text $Body
     $out = [System.Text.StringBuilder]::new()
     [void]$out.AppendLine()
     [void]$out.AppendLine('  --- Block diagnostics ---')
     if ($lines.Count -gt 0) { [void]$out.AppendLine(($lines -join [Environment]::NewLine)) }
-    if ($hint)    { [void]$out.AppendLine("  Likely cause: $hint") }
+    if ($hint) { [void]$out.AppendLine("  Likely cause: $hint") }
     if ($snippet) { [void]$out.AppendLine("  Body: $snippet") }
     return $out.ToString().TrimEnd()
 }
 
-function Invoke-CherryCurlRequest {
+#endregion
+
+#region Collection Fetching & JsonDocument Parsing
+
+function ConvertFrom-ProductsJson {
     param(
         [Parameter(Mandatory)]
-        [string]$Uri
+        [AllowEmptyString()]
+        [string]$JsonText,
+
+        [Parameter(Mandatory)]
+        [string]$SourceUrl
     )
 
-    $curlCommand = Get-NativeCurlCommand
-
-    if (-not $curlCommand) {
-        throw 'Native curl was not found.'
+    $doc = $null
+    try {
+        $doc = [System.Text.Json.JsonDocument]::Parse($JsonText)
     }
-
-    $headerFile = [System.IO.Path]::GetTempFileName()
-
-    $arguments = @(
-        '--location',
-        '--silent',
-        '--show-error',
-        '--max-time',
-        '45',
-        '--user-agent',
-        $Headers['User-Agent'],
-        '--dump-header',
-        $headerFile,
-        '--write-out',
-        "`n%{http_code}",
-        $Uri
-    )
+    catch {
+        $snippet = Get-BodySnippet -Text $JsonText
+        throw (New-CherryRequestException -Kind 'HttpError' -Message "Unexpected non-JSON response from '$SourceUrl'. Content starts: $snippet")
+    }
 
     try {
-        $output = & $curlCommand.Source @arguments 2>&1
-        $exitCode = $LASTEXITCODE
-        $rawHeaders = if (Test-Path -LiteralPath $headerFile) { Get-Content -LiteralPath $headerFile -Raw } else { '' }
+        $root = $doc.RootElement
+        $productsElement = [System.Text.Json.JsonElement]::new()
+
+        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or
+            -not $root.TryGetProperty('products', [ref]$productsElement) -or
+            $productsElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+            $snippet = Get-BodySnippet -Text $JsonText
+            throw (New-CherryRequestException -Kind 'HttpError' -Message "Unexpected response from '$SourceUrl' (no 'products' property). Content starts: $snippet")
+        }
+
+        $products = [System.Collections.Generic.List[object]]::new()
+        $rawCount = 0
+        $prop = [System.Text.Json.JsonElement]::new()
+        $variantsEl = [System.Text.Json.JsonElement]::new()
+
+        foreach ($prodEl in $productsElement.EnumerateArray()) {
+            $rawCount++
+            if ($prodEl.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+                continue
+            }
+
+            if (-not $prodEl.TryGetProperty('handle', [ref]$prop) -or
+                $prop.ValueKind -ne [System.Text.Json.JsonValueKind]::String) {
+                continue
+            }
+
+            $handle = $prop.GetString()
+            if (-not $handle) {
+                continue
+            }
+
+            $title = ''
+            if ($prodEl.TryGetProperty('title', [ref]$prop) -and
+                $prop.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+                $title = $prop.GetString()
+            }
+
+            $spotsLeft = 0
+            if ($prodEl.TryGetProperty('variants', [ref]$variantsEl) -and
+                $variantsEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                $availableCount = 0
+                $inventorySum = 0
+                $hasInventory = $false
+
+                foreach ($varEl in $variantsEl.EnumerateArray()) {
+                    if ($varEl.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+                        continue
+                    }
+
+                    if (-not $varEl.TryGetProperty('available', [ref]$prop) -or
+                        $prop.ValueKind -ne [System.Text.Json.JsonValueKind]::True) {
+                        continue
+                    }
+
+                    $availableCount++
+                    if ($varEl.TryGetProperty('inventory_quantity', [ref]$prop) -and
+                        $prop.ValueKind -eq [System.Text.Json.JsonValueKind]::Number) {
+                        $qty = 0
+                        if ($prop.TryGetInt32([ref]$qty)) {
+                            $hasInventory = $true
+                            $inventorySum += $qty
+                        }
+                    }
+                }
+
+                $spotsLeft = if ($availableCount -eq 0) {
+                    0
+                }
+                elseif ($hasInventory) {
+                    $inventorySum
+                }
+                else {
+                    $availableCount
+                }
+            }
+
+            $products.Add([pscustomobject]@{
+                Handle    = $handle
+                Title     = $title
+                Url       = "$($script:BaseUrl)/products/$handle"
+                SpotsLeft = $spotsLeft
+            })
+        }
+
+        return [pscustomobject]@{
+            RawCount = $rawCount
+            Products = $products.ToArray()
+        }
     }
     finally {
-        Remove-Item -LiteralPath $headerFile -Force -ErrorAction SilentlyContinue
-    }
-
-    $lines = @($output)
-    $httpCode = 0
-    if ($lines.Count -gt 0) {
-        $lastLine = $lines[-1].ToString().Trim()
-        if ($lastLine -match '^\d{3}$') {
-            $httpCode = [int]$lastLine
-            if ($lines.Count -gt 1) {
-                $lines = $lines[0..($lines.Count - 2)]
-            }
-            else {
-                $lines = @()
-            }
-        }
-    }
-
-    $rawContent = ($lines -join [Environment]::NewLine)
-
-    if ($httpCode -eq 429 -or ($exitCode -eq 22 -and ($rawContent -match '429|local_rate_limited'))) {
-        $diag = Get-CherryBlockDiagnostics -RawHeaders $rawHeaders -Body $rawContent
-        throw "Rate limited (HTTP 429) by '$Uri'.$diag"
-    }
-
-    if ($httpCode -eq 403 -or ($exitCode -eq 22 -and ($rawContent -match '403|Forbidden'))) {
-        $diag = Get-CherryBlockDiagnostics -RawHeaders $rawHeaders -Body $rawContent
-        throw "Access blocked (HTTP 403) by '$Uri'.$diag"
-    }
-
-    if ($exitCode -ne 0) {
-        throw "curl exited with code $exitCode."
-    }
-
-    # Treat any HTTP error as a failure
-    if ($httpCode -ge 400) {
-        throw "HTTP $httpCode returned by '$Uri'."
-    }
-
-    return [pscustomobject]@{
-        Content    = $rawContent
-        StatusCode = $httpCode
+        $doc.Dispose()
     }
 }
 
-$script:BrowserFallbackDisabled = $false
+$script:PlaywrightPaginatorScript = @'
+import { pathToFileURL } from 'node:url';
 
-function Get-NativeBrowserPath {
-    # Finds a Chromium-based browser that is already installed (Edge ships with Windows 11).
-    $candidates = @()
-    foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA)) {
-        if ($root) {
-            $candidates += Join-Path $root 'Microsoft\Edge\Application\msedge.exe'
-            $candidates += Join-Path $root 'Google\Chrome\Application\chrome.exe'
-        }
-    }
-    $candidates += '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-    $candidates += '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'
+const [playwrightEntry, baseUrl, profileDir, maxPagesRaw, timeoutSecRaw, ...rest] = process.argv.slice(2);
+const maxPages = Number(maxPagesRaw) || 10;
+const timeoutMs = (Number(timeoutSecRaw) || 60) * 1000;
+const headed = rest.includes('--headed');
 
-    foreach ($path in $candidates) {
-        if ($path -and (Test-Path -LiteralPath $path)) { return $path }
-    }
-    foreach ($name in 'microsoft-edge', 'google-chrome', 'chromium', 'chromium-browser') {
-        $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($cmd) { return $cmd.Source }
-    }
-    return $null
+// Never call process.exit() after writing to stdout: on a pipe the write is async on
+// POSIX and exit() truncates large payloads. Set exitCode and let the process drain.
+function emit(result, code) {
+  process.stdout.write(JSON.stringify(result));
+  process.exitCode = code;
 }
 
-function Invoke-CherryNativeBrowserRequest {
-    # No-install fallback: drive the system's own Edge/Chrome headless and dump the page.
+const isChallenge = (title) => /Verifying|Just a moment|Attention Required/i.test(title || '');
+
+function snippet(text, limit = 300) {
+  const clean = String(text || '').replace(/\s+/g, ' ').trim();
+  return clean.length > limit ? clean.slice(0, limit) + '...' : clean;
+}
+
+function countSpots(product) {
+  const variants = Array.isArray(product?.variants) ? product.variants : [];
+  const available = variants.filter((v) => v && v.available === true);
+  if (available.length === 0) return 0;
+
+  let spots = 0;
+  let hasInventory = false;
+  for (const v of available) {
+    if (typeof v.inventory_quantity === 'number' && Number.isFinite(v.inventory_quantity)) {
+      hasInventory = true;
+      spots += Math.trunc(v.inventory_quantity);
+    }
+  }
+  return hasInventory ? spots : available.length;
+}
+
+async function launch(chromium) {
+  const base = { headless: !headed, args: ['--no-sandbox'] };
+  const attempts = [{ channel: 'chrome' }, { channel: 'msedge' }, {}];
+  let lastError;
+  for (const extra of attempts) {
+    try {
+      return await chromium.launchPersistentContext(profileDir, { ...base, ...extra });
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError;
+}
+
+async function loadViaNavigation(page, url) {
+  const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+  let status = response ? response.status() : 0;
+
+  const deadline = Date.now() + timeoutMs;
+  let challenged = isChallenge(await page.title().catch(() => ''));
+  while (challenged && Date.now() < deadline) {
+    await page.waitForTimeout(2000);
+    challenged = isChallenge(await page.title().catch(() => ''));
+  }
+
+  if (!challenged && status === 403) {
+    const again = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    status = again ? again.status() : status;
+  }
+
+  const body = challenged ? '' : await page.evaluate(() => (document.body ? document.body.innerText : ''));
+  const title = await page.title().catch(() => '(none)');
+  return { status, body, challenged, title };
+}
+
+function parseProductsPayload(body, url, title) {
+  const trimmed = String(body || '').trimStart();
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    const looksLikeJson = trimmed.startsWith('{') || trimmed.startsWith('[');
+    return {
+      ok: false,
+      error: looksLikeJson
+        ? `Browser fallback failed: '${url}' returned invalid JSON: ${snippet(body)}`
+        : `Browser fallback failed: '${url}' did not return JSON. Page title: '${title || '(none)'}'. Text: ${snippet(body)}`
+    };
+  }
+
+  if (!parsed || !Array.isArray(parsed.products)) {
+    return {
+      ok: false,
+      error: `Browser fallback failed: '${url}' returned JSON without a 'products' array: ${snippet(body)}`
+    };
+  }
+
+  return { ok: true, products: parsed.products };
+}
+
+let context;
+try {
+  const pw = await import(pathToFileURL(playwrightEntry).href);
+  try {
+    context = await launch(pw.chromium);
+  } catch (launchErr) {
+    emit({
+      status: 0,
+      challenged: false,
+      browserUnavailable: true,
+      products: [],
+      error: String(launchErr?.message ?? launchErr).split('\n')[0]
+    }, 2);
+  }
+
+  if (context) {
+    const page = context.pages()[0] ?? (await context.newPage());
+    const allProducts = [];
+
+    for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
+      const pageUrl = `${baseUrl}&page=${pageNum}`;
+      let result;
+
+      if (pageNum === 1) {
+        result = await loadViaNavigation(page, pageUrl);
+      } else {
+        const fetched = await page.evaluate(async (u) => {
+          const r = await fetch(u, { credentials: 'include', headers: { Accept: 'application/json' } });
+          return { status: r.status, text: await r.text() };
+        }, pageUrl);
+
+        if (fetched.status === 403) {
+          result = await loadViaNavigation(page, pageUrl);
+        } else {
+          result = { status: fetched.status, body: fetched.text, challenged: false, title: '(fetch)' };
+        }
+      }
+
+      if (result.challenged) {
+        emit({
+          status: result.status || 403,
+          challenged: true,
+          products: [],
+          error: `Access blocked (HTTP 403) by '${pageUrl}'. The browser could not pass the Cloudflare challenge; try -Headed.`
+        }, 3);
+        break;
+      }
+
+      if (result.status >= 400) {
+        emit({
+          status: result.status,
+          challenged: false,
+          products: [],
+          error: `HTTP ${result.status} returned by '${pageUrl}'.`
+        }, 4);
+        break;
+      }
+
+      let parsed = parseProductsPayload(result.body, pageUrl, result.title);
+      if (!parsed.ok && pageNum > 1) {
+        result = await loadViaNavigation(page, pageUrl);
+        if (result.challenged) {
+          emit({
+            status: result.status || 403,
+            challenged: true,
+            products: [],
+            error: `Access blocked (HTTP 403) by '${pageUrl}'. The browser could not pass the Cloudflare challenge; try -Headed.`
+          }, 3);
+          break;
+        }
+        if (result.status >= 400) {
+          emit({
+            status: result.status,
+            challenged: false,
+            products: [],
+            error: `HTTP ${result.status} returned by '${pageUrl}'.`
+          }, 4);
+          break;
+        }
+        parsed = parseProductsPayload(result.body, pageUrl, result.title);
+      }
+
+      if (!parsed.ok) {
+        emit({ status: result.status, challenged: false, products: [], error: parsed.error }, 5);
+        break;
+      }
+
+      for (const p of parsed.products) {
+        if (p && typeof p.handle === 'string' && p.handle.length > 0) {
+          allProducts.push({
+            handle: p.handle,
+            title: typeof p.title === 'string' ? p.title : '',
+            spotsLeft: countSpots(p)
+          });
+        }
+      }
+
+      if (parsed.products.length < 250) {
+        emit({ status: 200, challenged: false, products: allProducts }, 0);
+        break;
+      }
+
+      if (pageNum === maxPages) {
+        emit({ status: 200, challenged: false, products: allProducts }, 0);
+      }
+    }
+  }
+} catch (e) {
+  emit({
+    status: 0,
+    challenged: false,
+    browserUnavailable: false,
+    products: [],
+    error: String(e?.message ?? e).split('\n')[0]
+  }, 1);
+} finally {
+  if (context) {
+    await context.close().catch(() => {});
+  }
+}
+'@
+
+function Get-CollectionProductsViaPlaywright {
     param(
-        [Parameter(Mandatory)]
-        [string]$Uri
+        [int]$MaximumPages = 10,
+        [int]$TimeoutSeconds = 60
+    )
+
+    $nodePath = Get-NodePath
+    if (-not $nodePath) {
+        return $null
+    }
+
+    $playwrightEntry = Join-Path $PSScriptRoot 'node_modules/playwright-core/index.mjs'
+    if (-not (Test-Path -LiteralPath $playwrightEntry)) {
+        $playwrightEntry = Join-Path $PSScriptRoot 'node_modules/playwright-core/index.js'
+        if (-not (Test-Path -LiteralPath $playwrightEntry)) {
+            return $null
+        }
+    }
+
+    $profileDir = Join-Path $PSScriptRoot '.browser-profile'
+    $args = [System.Collections.Generic.List[string]]::new()
+    $args.Add('--input-type=module')
+    $args.Add('-')
+    $args.Add($playwrightEntry)
+    $args.Add($script:ProductsJsonBaseUrl)
+    $args.Add($profileDir)
+    $args.Add([string]$MaximumPages)
+    $args.Add([string]$TimeoutSeconds)
+    if ($Headed) {
+        $args.Add('--headed')
+    }
+
+    Write-Verbose "Loading collection products JSON via Node + Playwright ($($script:ProductsJsonBaseUrl))."
+
+    $processTimeoutMs = [Math]::Min(600000, ($MaximumPages * $TimeoutSeconds + 30) * 1000)
+    $procResult = Invoke-ExternalProcess `
+        -FilePath $nodePath `
+        -Arguments $args.ToArray() `
+        -StandardInput $script:PlaywrightPaginatorScript `
+        -TimeoutMilliseconds $processTimeoutMs
+
+    $json = $null
+    if ($procResult.StdOut -and $procResult.StdOut.Trim()) {
+        try {
+            $json = $procResult.StdOut | ConvertFrom-Json
+        }
+        catch {
+            $json = $null
+        }
+    }
+
+    if (-not $json) {
+        $errDetail = ($procResult.StdErr, $procResult.StdOut | Where-Object { $_ -and $_.Trim() }) -join ' '
+        throw (New-CherryRequestException `
+            -Kind 'BrowserUnavailable' `
+            -Message "Browser fallback failed (exit $($procResult.ExitCode)): $($errDetail.Trim())")
+    }
+
+    $hasBrowserUnavailable = $json.PSObject.Properties['browserUnavailable'] -and $json.browserUnavailable
+    if ($hasBrowserUnavailable) {
+        throw (New-CherryRequestException `
+            -Kind 'BrowserUnavailable' `
+            -Message "Browser fallback failed: $($json.error). If the browser is missing run: npx playwright-core install chromium-headless-shell (on Linux, if it then fails to start: sudo npx playwright install-deps chromium)")
+    }
+
+    $status = if ($json.PSObject.Properties['status']) { [int]$json.status } else { 0 }
+    $challenged = $json.PSObject.Properties['challenged'] -and $json.challenged
+    $errorMsg = if ($json.PSObject.Properties['error'] -and $json.error) { [string]$json.error } else { '' }
+
+    if ($challenged -or $status -eq 403) {
+        $msg = if ($errorMsg) { $errorMsg } else { "Access blocked (HTTP 403) by '$($script:ProductsJsonBaseUrl)'. The browser could not pass the Cloudflare challenge; try -Headed." }
+        throw (New-CherryRequestException -Kind 'Blocked' -StatusCode 403 -Message $msg)
+    }
+
+    if ($status -eq 429) {
+        $msg = if ($errorMsg) { $errorMsg } else { "Rate limited (HTTP 429) by '$($script:ProductsJsonBaseUrl)'." }
+        throw (New-CherryRequestException -Kind 'RateLimited' -StatusCode 429 -Message $msg)
+    }
+
+    if ($errorMsg -or $status -ge 400) {
+        $msg = if ($errorMsg) { $errorMsg } else { "HTTP $status returned by '$($script:ProductsJsonBaseUrl)'." }
+        throw (New-CherryRequestException -Kind 'HttpError' -StatusCode $status -Message $msg)
+    }
+
+    $products = [System.Collections.Generic.List[object]]::new()
+    if ($json.PSObject.Properties['products'] -and $json.products) {
+        foreach ($p in $json.products) {
+            if (-not $p.handle) {
+                continue
+            }
+            $products.Add([pscustomobject]@{
+                Handle    = [string]$p.handle
+                Title     = [string]$p.title
+                Url       = "$($script:BaseUrl)/products/$($p.handle)"
+                SpotsLeft = [int]$p.spotsLeft
+            })
+        }
+    }
+
+    return $products.ToArray()
+}
+
+function Get-CollectionProductsViaNativeBrowser {
+    param(
+        [int]$MaximumPages = 10
     )
 
     $browser = Get-NativeBrowserPath
     if (-not $browser) {
-        throw 'Browser fallback unavailable: no Edge or Chrome found.'
+        throw (New-CherryRequestException `
+            -Kind 'BrowserUnavailable' `
+            -Message 'Browser fallback unavailable: no Edge or Chrome found.')
     }
 
     $profileDir = Join-Path $PSScriptRoot '.browser-profile/native'
     $null = New-Item -ItemType Directory -Force -Path $profileDir
 
-    Write-Verbose "Loading '$Uri' in $browser (headless)."
-    # Edge/Chrome are GUI-subsystem programs on Windows, so '&' neither waits for them
-    # nor captures their stdout. Start-Process -Wait with file redirection does both.
-    $outFile = [System.IO.Path]::GetTempFileName()
-    $errFile = [System.IO.Path]::GetTempFileName()
-    try {
+    $allProducts = [System.Collections.Generic.List[object]]::new()
+
+    for ($page = 1; $page -le $MaximumPages; $page++) {
+        $pageUrl = "$($script:ProductsJsonBaseUrl)&page=$page"
+        Write-Verbose "Loading '$pageUrl' in $browser (headless)."
+
         $browserArgs = @(
             '--headless=new',
             '--disable-gpu',
             '--no-first-run',
             '--no-default-browser-check',
-            "--user-data-dir=`"$profileDir`"",
+            "--user-data-dir=$profileDir",
             '--virtual-time-budget=20000',
             '--dump-dom',
-            "`"$Uri`""
+            $pageUrl
         )
-        $proc = Start-Process -FilePath $browser -ArgumentList $browserArgs `
-            -Wait -PassThru -NoNewWindow `
-            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-        $exitCode = $proc.ExitCode
-        $dom = Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue
-        if (-not $dom) { $dom = '' }
-    }
-    finally {
-        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
-    }
 
-    if (-not $dom.Trim()) {
-        throw "Browser fallback failed (exit $exitCode): $browser produced no output."
-    }
-    if ($dom -match '<title>[^<]*(Verifying|Just a moment|Attention Required)') {
-        throw "Access blocked (HTTP 403) by '$Uri'. The headless browser could not pass the Cloudflare challenge."
-    }
+        $procResult = Invoke-ExternalProcess `
+            -FilePath $browser `
+            -Arguments $browserArgs `
+            -TimeoutMilliseconds 60000
 
-    # Chromium renders a JSON response as <pre>...</pre>; unwrap it for .json URLs
-    $content = $dom
-    if ($Uri -match '\.json(\?|$)' -and $dom -match '(?s)<pre[^>]*>(.*?)</pre>') {
-        $content = [System.Net.WebUtility]::HtmlDecode($Matches[1])
-    }
-
-    # A .json URL that did not yield JSON (or a products.json without "products") is an
-    # error/interstitial page or an unexpected payload, not data: say what it was
-    $badJson = $false
-    if ($Uri -match '\.json(\?|$)') {
-        if ($content.TrimStart() -notmatch '^[\{\[]') { $badJson = $true }
-        elseif ($Uri -match 'products\.json' -and $content -notmatch '"products"\s*:') { $badJson = $true }
-    }
-    if ($badJson) {
-        if ($content.TrimStart() -match '^[\{\[]') {
-            $snippet = ($content -replace '\s+', ' ')
-            if ($snippet.Length -gt 300) { $snippet = $snippet.Substring(0, 300) + '...' }
-            throw "Browser fallback failed: '$Uri' returned JSON without a 'products' key: $snippet"
+        $dom = if ($procResult.StdOut) { $procResult.StdOut } else { '' }
+        if (-not $dom.Trim()) {
+            throw (New-CherryRequestException `
+                -Kind 'BrowserUnavailable' `
+                -Message "Browser fallback failed (exit $($procResult.ExitCode)): $browser produced no output.")
         }
-        $title = if ($dom -match '(?is)<title[^>]*>(.*?)</title>') { ($Matches[1] -replace '\s+', ' ').Trim() } else { '(none)' }
-        $text = ($dom -replace '(?is)<(script|style)[^>]*>.*?</\1>', ' ' -replace '<[^>]+>', ' ' -replace '\s+', ' ').Trim()
-        if ($text.Length -gt 300) { $text = $text.Substring(0, 300) + '...' }
-        throw "Browser fallback failed: '$Uri' did not return JSON. Page title: '$title'. Text: $text"
+
+        if ($dom -match '<title>[^<]*(Verifying|Just a moment|Attention Required)') {
+            throw (New-CherryRequestException `
+                -Kind 'Blocked' `
+                -StatusCode 403 `
+                -Message "Access blocked (HTTP 403) by '$pageUrl'. The headless browser could not pass the Cloudflare challenge.")
+        }
+
+        # Chromium renders a JSON response inside <pre>...</pre>; unwrap it.
+        $content = $dom
+        if ($dom -match '(?s)<pre[^>]*>(.*?)</pre>') {
+            $content = [System.Net.WebUtility]::HtmlDecode($Matches[1])
+        }
+
+        if ($content.TrimStart() -notmatch '^[\{\[]') {
+            $title = if ($dom -match '(?is)<title[^>]*>(.*?)</title>') {
+                ($Matches[1] -replace '\s+', ' ').Trim()
+            }
+            else {
+                '(none)'
+            }
+            $plainText = ($dom -replace '(?is)<(script|style)[^>]*>.*?</\1>', ' ' -replace '<[^>]+>', ' ')
+            $snippet = Get-BodySnippet -Text $plainText
+            throw (New-CherryRequestException `
+                -Kind 'HttpError' `
+                -Message "Browser fallback failed: '$pageUrl' did not return JSON. Page title: '$title'. Text: $snippet")
+        }
+
+        $parsed = ConvertFrom-ProductsJson -JsonText $content -SourceUrl $pageUrl
+        foreach ($p in $parsed.Products) {
+            $allProducts.Add($p)
+        }
+
+        if ($parsed.RawCount -lt 250) {
+            break
+        }
     }
 
-    return [pscustomobject]@{
-        Content    = $content
-        StatusCode = 200
-    }
+    return $allProducts.ToArray()
 }
 
-function Invoke-CherryBrowserRequest {
-    # Load the URL in a real browser (the default; it passes Cloudflare's managed challenge).
-    # Prefers the Node + Playwright helper when it is set up; otherwise uses the
-    # system's own Edge/Chrome so nothing has to be installed.
+function Invoke-CherryCurlRequest {
     param(
         [Parameter(Mandatory)]
-        [string]$Uri
+        [string]$Uri,
+
+        [Parameter(Mandatory)]
+        [string]$CurlPath
     )
 
-    $helper = Join-Path $PSScriptRoot 'browser-fetch.mjs'
-    $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $headerFile = [System.IO.Path]::GetTempFileName()
+    $bodyFile = [System.IO.Path]::GetTempFileName()
 
-    if (-not $node -or
-        -not (Test-Path -LiteralPath $helper) -or
-        -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'node_modules/playwright-core'))) {
-        return Invoke-CherryNativeBrowserRequest -Uri $Uri
+    $arguments = @(
+        '--location',
+        '--silent',
+        '--show-error',
+        '--max-time', '45',
+        '--user-agent', $script:Headers['User-Agent'],
+        '--header', "Accept: $($script:Headers['Accept'])",
+        '--dump-header', $headerFile,
+        '--output', $bodyFile,
+        '--write-out', '%{http_code}',
+        $Uri
+    )
+
+    try {
+        $procResult = Invoke-ExternalProcess `
+            -FilePath $CurlPath `
+            -Arguments $arguments `
+            -TimeoutMilliseconds 55000
+
+        $rawHeaders = if (Test-Path -LiteralPath $headerFile) {
+            [System.IO.File]::ReadAllText($headerFile, $script:Utf8NoBom)
+        }
+        else {
+            ''
+        }
+        $body = if (Test-Path -LiteralPath $bodyFile) {
+            [System.IO.File]::ReadAllText($bodyFile, $script:Utf8NoBom)
+        }
+        else {
+            ''
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $headerFile, $bodyFile -Force -ErrorAction SilentlyContinue
     }
 
-    $nodeArgs = @($helper, $Uri)
-    if ($Headed) { $nodeArgs += '--headed' }
-
-    Write-Verbose "Loading '$Uri' in a real browser."
-    $output = & $node.Source @nodeArgs 2>&1
-    $exitCode = $LASTEXITCODE
-
-    $json = $null
-    try { $json = ($output | Out-String) | ConvertFrom-Json } catch { }
-
-    if (-not $json) {
-        throw "Browser fallback failed (exit $exitCode): $(($output | Out-String).Trim())"
-    }
-    if ($json.PSObject.Properties['error'] -and $json.error) {
-        throw "Browser fallback failed: $($json.error). If the browser is missing run: npx playwright-core install chromium-headless-shell (on Linux, if it then fails to start: sudo npx playwright install-deps chromium)"
-    }
-    if ($json.challenged) {
-        throw "Access blocked (HTTP 403) by '$Uri'. The browser could not pass the Cloudflare challenge; try -Headed."
-    }
-    if ([int]$json.status -ge 400) {
-        throw "HTTP $($json.status) returned by '$Uri'."
+    $httpCode = 0
+    $codeText = if ($procResult.StdOut) { $procResult.StdOut.Trim() } else { '' }
+    if ($codeText -match '^\d{3}$') {
+        $httpCode = [int]$codeText
     }
 
-    return [pscustomobject]@{
-        Content    = [string]$json.body
-        StatusCode = [int]$json.status
+    if ($httpCode -eq 429 -or $body -match 'local_rate_limited') {
+        $diag = Get-CherryBlockDiagnostics -RawHeaders $rawHeaders -Body $body
+        throw (New-CherryRequestException `
+            -Kind 'RateLimited' `
+            -StatusCode 429 `
+            -Message "Rate limited (HTTP 429) by '$Uri'.$diag")
     }
+
+    if ($httpCode -eq 403) {
+        $diag = Get-CherryBlockDiagnostics -RawHeaders $rawHeaders -Body $body
+        throw (New-CherryRequestException `
+            -Kind 'Blocked' `
+            -StatusCode 403 `
+            -Message "Access blocked (HTTP 403) by '$Uri'.$diag")
+    }
+
+    if ($procResult.ExitCode -ne 0) {
+        $stderr = if ($procResult.StdErr) { " $($procResult.StdErr.Trim())" } else { '' }
+        throw (New-CherryRequestException `
+            -Kind 'HttpError' `
+            -StatusCode $httpCode `
+            -Message "curl exited with code $($procResult.ExitCode).$stderr")
+    }
+
+    if ($httpCode -ge 400 -or $httpCode -eq 0) {
+        throw (New-CherryRequestException `
+            -Kind 'HttpError' `
+            -StatusCode $httpCode `
+            -Message "HTTP $httpCode returned by '$Uri'.")
+    }
+
+    return $body
 }
 
-function Invoke-CherryRequest {
+function Invoke-CherryHttpRequest {
     param(
         [Parameter(Mandatory)]
         [string]$Uri,
 
         [ValidateRange(1, 10)]
-        [int]$MaximumAttempts = 3
+        [int]$MaximumAttempts = 2
     )
 
-    # The real browser is the default. If it cannot run at all (no Edge/Chrome, no
-    # Playwright), warn once and carry on with curl for the rest of the run.
-    if (-not $NoBrowser -and -not $script:BrowserFallbackDisabled) {
-        try {
-            return Invoke-CherryBrowserRequest -Uri $Uri
-        }
-        catch {
-            if ($_.Exception.Message -like 'Browser fallback*') {
-                $script:BrowserFallbackDisabled = $true
-                Write-Warning "$($_.Exception.Message) Falling back to curl for this run."
-            }
-            else {
-                throw
-            }
-        }
-    }
-
-    $curlCommand = Get-NativeCurlCommand
+    $curlPath = Get-NativeCurlPath
 
     for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
         try {
-            if ($curlCommand) {
-                return Invoke-CherryCurlRequest -Uri $Uri
+            if ($curlPath) {
+                return Invoke-CherryCurlRequest -Uri $Uri -CurlPath $curlPath
             }
 
-            return Invoke-WebRequest `
+            $response = Invoke-WebRequest `
                 -Uri $Uri `
-                -Headers $Headers `
+                -Headers $script:Headers `
                 -MaximumRedirection 5 `
                 -TimeoutSec 45
+            return [string]$response.Content
         }
         catch {
-            $statusCode = $null
-            $retryAfterSeconds = $null
-
-            # PS7: HttpRequestException with .StatusCode property or .Response.StatusCode
-            if ($_.Exception.PSObject.Properties['StatusCode'] -and $_.Exception.StatusCode) {
-                try { $statusCode = [int]$_.Exception.StatusCode } catch { }
-            }
-            if (-not $statusCode -and $_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
-                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+            $kind = Get-ExceptionKind -Exception $_.Exception
+            if ($kind -in @('RateLimited', 'Blocked')) {
+                throw
             }
 
-            # Retry-After header inspection
-            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response -and $_.Exception.Response.Headers) {
-                try {
-                    if ($_.Exception.Response.Headers.RetryAfter -and $_.Exception.Response.Headers.RetryAfter.Delta) {
-                        $retryAfterSeconds = $_.Exception.Response.Headers.RetryAfter.Delta.TotalSeconds
-                    }
-                } catch { }
-                try {
-                    if (-not $retryAfterSeconds -and $_.Exception.Response.Headers.Contains('Retry-After')) {
-                        $vals = @($_.Exception.Response.Headers.GetValues('Retry-After'))
-                        if ($vals.Count -gt 0) {
-                            $retryAfterSeconds = [int]$vals[0]
+            if ($null -eq $kind) {
+                $statusCode = 0
+                $retryAfterSeconds = $null
+                $responseObj = if ($_.Exception.PSObject.Properties['Response']) { $_.Exception.Response } else { $null }
+
+                if ($_.Exception.PSObject.Properties['StatusCode'] -and $_.Exception.StatusCode) {
+                    try { $statusCode = [int]$_.Exception.StatusCode } catch { }
+                }
+                if ($statusCode -eq 0 -and $responseObj) {
+                    try { $statusCode = [int]$responseObj.StatusCode } catch { }
+                }
+
+                if ($responseObj -and $responseObj.Headers) {
+                    try {
+                        if ($responseObj.Headers.RetryAfter -and $responseObj.Headers.RetryAfter.Delta) {
+                            $retryAfterSeconds = [int]$responseObj.Headers.RetryAfter.Delta.TotalSeconds
                         }
                     }
-                } catch { }
-            }
-
-            # Detect rate-limiting (HTTP 429) across all checks
-            if ($statusCode -eq 429 -or ($_.Exception.Message -match '429|Too Many Requests')) {
-                $wait = if ($retryAfterSeconds) { " Retry after $([int]$retryAfterSeconds) seconds." } else { '' }
-                throw "Rate limited (HTTP 429) by '$Uri'.$wait"
-            }
-
-            if ($statusCode -eq 403 -or ($_.Exception.Message -match '403|Forbidden')) {
-                $rawHdr = ''
-                try {
-                    if ($_.Exception.Response -and $_.Exception.Response.Headers) {
-                        $rawHdr = ($_.Exception.Response.Headers | ForEach-Object { "$($_.Key): $($_.Value -join ', ')" }) -join "`n"
+                    catch { }
+                    try {
+                        if (-not $retryAfterSeconds -and $responseObj.Headers.Contains('Retry-After')) {
+                            $vals = @($responseObj.Headers.GetValues('Retry-After'))
+                            if ($vals.Count -gt 0) {
+                                $retryAfterSeconds = [int]$vals[0]
+                            }
+                        }
                     }
-                } catch { }
-                $body = if ($_.ErrorDetails) { [string]$_.ErrorDetails.Message } else { '' }
-                Write-Verbose "Request received 403 Forbidden for '$Uri'.$(Get-CherryBlockDiagnostics -RawHeaders $rawHdr -Body $body)"
-            }
+                    catch { }
+                }
 
-            if (-not $curlCommand -and $attempt -eq $MaximumAttempts) {
-                $fallbackCurl = Get-NativeCurlCommand
-                if ($fallbackCurl) {
-                    Write-Verbose (
-                        "PowerShell request failed for '$Uri'. " +
-                        "Trying native curl fallback. " +
-                        "Error: $($_.Exception.Message)"
-                    )
-                    return Invoke-CherryCurlRequest -Uri $Uri
+                if ($statusCode -eq 429 -or $_.Exception.Message -match '\b429\b|Too Many Requests') {
+                    $wait = if ($retryAfterSeconds) { " Retry after $retryAfterSeconds seconds." } else { '' }
+                    throw (New-CherryRequestException `
+                        -Kind 'RateLimited' `
+                        -StatusCode 429 `
+                        -Message "Rate limited (HTTP 429) by '$Uri'.$wait")
+                }
+
+                if ($statusCode -eq 403 -or $_.Exception.Message -match '\b403\b|Forbidden') {
+                    $rawHdr = ''
+                    try {
+                        if ($responseObj -and $responseObj.Headers) {
+                            $rawHdr = ($responseObj.Headers | ForEach-Object { "$($_.Key): $($_.Value -join ', ')" }) -join "`n"
+                        }
+                    }
+                    catch { }
+                    $body = if ($_.ErrorDetails) { [string]$_.ErrorDetails.Message } else { '' }
+                    $diag = Get-CherryBlockDiagnostics -RawHeaders $rawHdr -Body $body
+                    throw (New-CherryRequestException `
+                        -Kind 'Blocked' `
+                        -StatusCode 403 `
+                        -Message "Access blocked (HTTP 403) by '$Uri'.$diag")
                 }
             }
 
@@ -757,425 +1268,209 @@ function Invoke-CherryRequest {
                 "Retrying in $($attempt * 2) seconds. " +
                 "Error: $($_.Exception.Message)"
             )
-
             Start-Sleep -Seconds ($attempt * 2)
         }
     }
 }
 
-function Get-CollectionProductsJsonUrl {
+function Get-CollectionProductsViaHttp {
     param(
-        [Parameter(Mandatory)]
-        [string]$CollectionUrl
+        [int]$MaximumPages = 10
     )
 
-    $uri = [uri]$CollectionUrl
-    $path = $uri.AbsolutePath.TrimEnd('/')
+    $allProducts = [System.Collections.Generic.List[object]]::new()
 
-    if ($path -notmatch '^/collections/[^/]+$') {
-        return $null
-    }
-
-    return "$BaseUrl$path/products.json?limit=250"
-}
-
-function ConvertTo-AbsoluteProductUrl {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Href
-    )
-
-    if ($Href.StartsWith('//')) {
-        return "https:$Href"
-    }
-
-    if ($Href.StartsWith('/')) {
-        return "$BaseUrl$Href"
-    }
-
-    if ($Href -match '^https?://') {
-        return $Href
-    }
-
-    return "$BaseUrl/$Href"
-}
-
-function Get-CanonicalProductUrl {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Url
-    )
-
-    $uri = [uri]$Url
-
-    # The product URL itself is enough to identify the break.
-    # Preserve variant= when it exists.
-    $variant = $null
-
-    if ($uri.Query -match '(?:^\?|&)variant=(\d+)') {
-        $variant = $Matches[1]
-    }
-
-    $canonical = '{0}://{1}{2}' -f `
-        $uri.Scheme,
-        $uri.Host,
-        $uri.AbsolutePath.TrimEnd('/')
-
-    if ($variant) {
-        $canonical += "?variant=$variant"
-    }
-
-    return $canonical
-}
-
-function Get-ProductJsonUrl {
-    param(
-        [Parameter(Mandatory)]
-        [string]$ProductUrl
-    )
-
-    $uri = [uri]$ProductUrl
-
-    if ($uri.AbsolutePath -notmatch '/products/(?<handle>[^/?#]+)') {
-        return $null
-    }
-
-    return "$BaseUrl/products/$($Matches['handle']).js"
-}
-
-function Get-ProductJson {
-    param(
-        [Parameter(Mandatory)]
-        [string]$ProductUrl
-    )
-
-    if ($ProductJsonCache.ContainsKey($ProductUrl)) {
-        return $ProductJsonCache[$ProductUrl]
-    }
-
-    $productJsonUrl = Get-ProductJsonUrl -ProductUrl $ProductUrl
-
-    if (-not $productJsonUrl) {
-        $ProductJsonCache[$ProductUrl] = $null
-        return $null
-    }
-
-    try {
-        Write-Verbose "Loading product JSON: $productJsonUrl"
-        $jsonResponse = Invoke-CherryRequest `
-            -Uri $productJsonUrl `
-            -MaximumAttempts 1
-        $product = $jsonResponse.Content | ConvertFrom-Json
-        $ProductJsonCache[$ProductUrl] = $product
-
-        return $product
-    }
-    catch {
-        if ($_.Exception.Message -like 'Rate limited*' -or
-            $_.Exception.Message -like 'Access blocked*' -or
-            $_.Exception.Message -match '429|403') {
-            throw
-        }
-
-        Write-Verbose (
-            "Could not load product JSON for '$ProductUrl': " +
-            $_.Exception.Message
-        )
-
-        $ProductJsonCache[$ProductUrl] = $null
-        return $null
-    }
-}
-
-function Read-ProductJsonIntoCache {
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [string[]]$ProductUrls,
-
-        [ValidateRange(1, 16)]
-        [int]$ThrottleLimit = 3
-    )
-
-    # Product data is already populated in $ProductJsonCache when
-    # Add-ProductLinksFromCollectionJson runs (which seeds the cache from
-    # products.json). Per-product .js endpoints are aggressively rate-limited
-    # by Cloudflare and are not fetched individually.
-}
-
-function Get-SpotsLeftFromProductJson {
-    param(
-        [Parameter(Mandatory)]
-        [pscustomobject]$Product
-    )
-
-    $availableVariants = @(
-        $Product.variants |
-            Where-Object { $_.available }
-    )
-
-    if (-not $availableVariants) {
-        return [pscustomobject]@{
-            SpotsLeft = 0
-            Status    = 'Sold out'
-            Found     = $true
-        }
-    }
-
-    $spots = 0
-    $hasInventoryQuantities = $false
-
-    foreach ($variant in $availableVariants) {
-        # products.json variants may omit inventory_quantity entirely.
-        if ($variant.PSObject.Properties['inventory_quantity'] -and
-            $null -ne $variant.inventory_quantity) {
-            $hasInventoryQuantities = $true
-            $spots += [int]$variant.inventory_quantity
-        }
-    }
-
-    if (-not $hasInventoryQuantities) {
-        $spots = $availableVariants.Count
-    }
-
-    $noun = if ($spots -eq 1) { 'spot' } else { 'spots' }
-
-    return [pscustomobject]@{
-        SpotsLeft = $spots
-        Status    = "$spots $noun left"
-        Found     = $true
-    }
-}
-
-function Get-QueryParameter {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Url,
-
-        [Parameter(Mandatory)]
-        [string]$Name
-    )
-
-    $query = ([uri]$Url).Query
-
-    if ($query -match "(?:^\?|&)$([regex]::Escape($Name))=([^&]+)") {
-        return $Matches[1]
-    }
-
-    return $null
-}
-
-function Add-QueryParameter {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Url,
-
-        [Parameter(Mandatory)]
-        [string]$Name,
-
-        [Parameter(Mandatory)]
-        [string]$Value
-    )
-
-    $separator = if ($Url.Contains('?')) { '&' } else { '?' }
-
-    return "$Url$separator$Name=$Value"
-}
-
-function Set-QueryParameter {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Url,
-
-        [Parameter(Mandatory)]
-        [string]$Name,
-
-        [Parameter(Mandatory)]
-        [string]$Value
-    )
-
-    $parts = $Url -split '\?', 2
-
-    if ($parts.Count -eq 1) {
-        return Add-QueryParameter -Url $Url -Name $Name -Value $Value
-    }
-
-    $escapedName = [regex]::Escape($Name)
-    $parameters = @(
-        $parts[1] -split '&' |
-            Where-Object {
-                $_ -and $_ -notmatch "^$escapedName="
-            }
-    )
-
-    $parameters += "$Name=$Value"
-
-    return "$($parts[0])?$($parameters -join '&')"
-}
-
-function Add-ProductUrl {
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [System.Collections.Generic.HashSet[string]]$ProductUrls,
-
-        [Parameter(Mandatory)]
-        [string]$Href
-    )
-
-    $href = $Href `
-        -replace '\u0026', '&' `
-        -replace '\/', '/'
-
-    if ($href -notmatch '/products/') {
-        return $false
-    }
-
-    $absoluteUrl = ConvertTo-AbsoluteProductUrl -Href $href
-    $canonicalUrl = Get-CanonicalProductUrl -Url $absoluteUrl
-
-    return $ProductUrls.Add($canonicalUrl)
-}
-
-function Add-ProductLinksFromCollectionJson {
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [System.Collections.Generic.HashSet[string]]$ProductUrls,
-
-        [Parameter(Mandatory)]
-        [string]$CollectionUrl
-    )
-
-    $productsJsonUrl = Get-CollectionProductsJsonUrl `
-        -CollectionUrl $CollectionUrl
-
-    if (-not $productsJsonUrl) {
-        return 0
-    }
-
-    $addedCount = 0
-    $maximumPages = 10
-
-    for ($page = 1; $page -le $maximumPages; $page++) {
-        $pageUrl = Set-QueryParameter `
-            -Url $productsJsonUrl `
-            -Name 'page' `
-            -Value $page
-
+    for ($page = 1; $page -le $MaximumPages; $page++) {
+        $pageUrl = "$($script:ProductsJsonBaseUrl)&page=$page"
         Write-Verbose "Loading collection products JSON page $page`: $pageUrl"
 
-        $response = Invoke-CherryRequest `
-            -Uri $pageUrl `
-            -MaximumAttempts 1
-        $json = $response.Content | ConvertFrom-Json
-        if (-not $json -or -not $json.PSObject.Properties['products']) {
-            $snippet = ([string]$response.Content -replace '\s+', ' ')
-            if ($snippet.Length -gt 300) { $snippet = $snippet.Substring(0, 300) + '...' }
-            throw "Unexpected response from '$pageUrl' (no 'products' property). Content starts: $snippet"
-        }
-        $products = @($json.products)
+        $content = Invoke-CherryHttpRequest -Uri $pageUrl
+        $parsed = ConvertFrom-ProductsJson -JsonText $content -SourceUrl $pageUrl
 
-        foreach ($product in $products) {
-            if (-not $product.handle) {
-                continue
-            }
-
-            $productUrl = "$BaseUrl/products/$($product.handle)"
-
-            # products.json already carries title and variant availability,
-            # so seed the cache and skip the per-product .js request later.
-            if (-not $ProductJsonCache.ContainsKey($productUrl)) {
-                $ProductJsonCache[$productUrl] = $product
-            }
-
-            if (Add-ProductUrl `
-                    -ProductUrls $ProductUrls `
-                    -Href $productUrl) {
-                $addedCount++
-            }
+        foreach ($p in $parsed.Products) {
+            $allProducts.Add($p)
         }
 
-        if ($products.Count -lt 250) {
+        if ($parsed.RawCount -lt 250) {
             break
         }
     }
 
-    return $addedCount
+    return $allProducts.ToArray()
 }
 
-function Get-ProductLinks {
-    param(
-        [Parameter(Mandatory)]
-        [string]$CollectionUrl
-    )
+function Get-CollectionProducts {
+    $rawProducts = $null
 
-    Write-Verbose "Loading collection products JSON: $CollectionUrl"
+    if (-not $NoBrowser) {
+        $playwrightUnavailableMsg = $null
 
-    $productUrls = [System.Collections.Generic.HashSet[string]]::new(
-        [System.StringComparer]::OrdinalIgnoreCase
-    )
-
-    $collectionPath = ([uri]$CollectionUrl).AbsolutePath
-
-    $jsonCount = Add-ProductLinksFromCollectionJson `
-        -ProductUrls $productUrls `
-        -CollectionUrl $CollectionUrl
-
-    if ($jsonCount -gt 0) {
-        $CollectionJsonLoaded[$collectionPath] = $true
-    }
-    elseif ($jsonCount -eq 0) {
-        Write-Warning "No products found in collection JSON for '$CollectionUrl'."
-    }
-
-    return @($productUrls | Sort-Object)
-}
-
-function Get-CherryBreak {
-    param(
-        [Parameter(Mandatory)]
-        [string]$ProductUrl
-    )
-
-    Write-Verbose "Checking product: $ProductUrl"
-
-    try {
-        $product = Get-ProductJson -ProductUrl $ProductUrl
-
-        if ($product) {
-            $title = $product.title
-            $spotResult = Get-SpotsLeftFromProductJson -Product $product
+        try {
+            $rawProducts = Get-CollectionProductsViaPlaywright
         }
-        else {
-            $title = 'Unknown break'
-            $spotResult = [pscustomobject]@{
-                SpotsLeft = $null
-                Status    = 'Spots unavailable'
-                Found     = $false
+        catch {
+            if ((Get-ExceptionKind -Exception $_.Exception) -eq 'BrowserUnavailable') {
+                $playwrightUnavailableMsg = $_.Exception.Message
+                Write-Verbose "$playwrightUnavailableMsg Trying system Edge/Chrome."
+            }
+            else {
+                throw
             }
         }
 
-        return [pscustomobject]@{
-            Title     = $title
-            SpotsLeft = $spotResult.SpotsLeft
-            Status    = $spotResult.Status
-            Url       = $ProductUrl
+        if ($null -eq $rawProducts) {
+            try {
+                $rawProducts = Get-CollectionProductsViaNativeBrowser
+            }
+            catch {
+                if ((Get-ExceptionKind -Exception $_.Exception) -eq 'BrowserUnavailable') {
+                    $reason = if ($playwrightUnavailableMsg) { $playwrightUnavailableMsg } else { $_.Exception.Message }
+                    Write-Warning "$reason Falling back to curl for this run."
+                    $rawProducts = $null
+                }
+                else {
+                    throw
+                }
+            }
         }
     }
-    catch {
-        if ($_.Exception.Message -like 'Rate limited*' -or
-            $_.Exception.Message -like 'Access blocked*' -or
-            $_.Exception.Message -match '429|403') {
-            throw
+
+    if ($null -eq $rawProducts) {
+        $rawProducts = Get-CollectionProductsViaHttp
+    }
+
+    $seenHandles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $uniqueProducts = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($product in $rawProducts) {
+        if ($product.Handle -and $seenHandles.Add($product.Handle)) {
+            $uniqueProducts.Add($product)
+        }
+    }
+
+    if ($uniqueProducts.Count -eq 0) {
+        Write-Warning "No products found in collection JSON for '$($script:ProductsJsonBaseUrl)'."
+    }
+
+    return $uniqueProducts.ToArray()
+}
+
+#endregion
+
+#region Date, Classification & Formatting
+
+function Get-TargetDay {
+    param(
+        [string]$RequestedDay
+    )
+
+    if ($RequestedDay) {
+        return $RequestedDay
+    }
+
+    return $script:SydneyNow.DayOfWeek.ToString()
+}
+
+function Get-TargetDate {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Day
+    )
+
+    $today = $script:SydneyNow.Date
+    $targetDayOfWeek = [System.DayOfWeek]::$Day
+    $daysUntilTarget = ([int]$targetDayOfWeek - [int]$today.DayOfWeek + 7) % 7
+
+    return $today.AddDays($daysUntilTarget)
+}
+
+function Get-TextBreakDate {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Text
+    )
+
+    $match = $script:MonthDayRegex.Match($Text)
+    if (-not $match.Success) {
+        $match = $script:DayMonthRegex.Match($Text)
+    }
+    if (-not $match.Success) {
+        return $null
+    }
+
+    $monthName = $match.Groups['month'].Value.ToLowerInvariant()
+    $month = $script:MonthNumbers[$monthName]
+    $dayOfMonth = [int]$match.Groups['day'].Value
+    $today = $script:SydneyNow.Date
+
+    $bestDate = $null
+    $bestDiff = [double]::MaxValue
+
+    # Check -1, 0, and +1 year to handle year rollovers and leap-year Feb 29 dates cleanly.
+    foreach ($candidateYear in ($today.Year - 1), $today.Year, ($today.Year + 1)) {
+        try {
+            $candidate = [datetime]::new($candidateYear, $month, $dayOfMonth)
+        }
+        catch {
+            continue
+        }
+
+        $diff = [Math]::Abs(($candidate - $today).TotalDays)
+        if ($diff -lt $bestDiff) {
+            $bestDiff = $diff
+            $bestDate = $candidate
+        }
+    }
+
+    return $bestDate
+}
+
+function Get-BreakClassification {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Title
+    )
+
+    $weeklyMatch = $script:WeeklyBreakNameRegex.Match($Title)
+    if ($weeklyMatch.Success) {
+        $rawName = $weeklyMatch.Groups['name'].Value.ToLowerInvariant()
+        $shortName = switch -Regex ($rawName) {
+            '^macho'   { 'Machos'; break }
+            '^spenda'  { 'Spenda'; break }
+            '^punter'  { 'Punterz'; break }
+            '^slugger' { 'Sluggerz'; break }
+            '^amigo'   { 'Amigos'; break }
         }
 
         return [pscustomobject]@{
-            Title     = 'Unable to load product'
-            SpotsLeft = $null
-            Status    = 'Request failed'
-            Url       = $ProductUrl
+            Category  = 'Weekly'
+            ShortName = $shortName
         }
+    }
+
+    $dailyMatch = $script:DailyBreakNameRegex.Match($Title)
+    if ($dailyMatch.Success) {
+        $shortName = switch ($dailyMatch.Groups['name'].Value.ToLowerInvariant()) {
+            'punterz'  { 'Punterz'; break }
+            'teamz'    { 'Teamz'; break }
+            'squadz'   { 'Squadz'; break }
+            'derby'    { 'Derby'; break }
+            'slapperz' { 'Slapperz'; break }
+        }
+
+        if ($dailyMatch.Groups['lil'].Success) {
+            $shortName = "Lil $shortName"
+        }
+
+        return [pscustomobject]@{
+            Category  = 'Daily'
+            ShortName = $shortName
+        }
+    }
+
+    return [pscustomobject]@{
+        Category  = 'Other'
+        ShortName = $null
     }
 }
 
@@ -1186,147 +1481,36 @@ function Remove-DateText {
     )
 
     $cleanText = $Text
-
-    # Remove weekday names when they form part of the advertised break date.
-    $cleanText = $cleanText -replace '(?i)\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b', ' '
-
-    # Remove dates written with month names, for example:
-    # 24 July, 24th July, July 24, July 24th, and optional years.
-    $months = 'Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?'
-
-    # Remove an entire parenthesised date/time label, for example:
-    # (Jul 27 4pm), (Jul 27 @ 4:00 PM), or (27 Jul - 4pm).
-    $time = '\d{1,2}(?::\d{2})?\s*(?:am|pm)'
-    $cleanText = $cleanText -replace "(?i)\(\s*(?:(?:$months)\s+\d{1,2}(?:st|nd|rd|th)?|\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:$months))(?:,?\s+20\d{2})?(?:\s*(?:@|at|-)?\s*$time)?\s*\)", ' '
-
-    $cleanText = $cleanText -replace "(?i)\b(?:$months)\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+20\d{2})?(?:\s*(?:@|at|-)?\s*$time)?\b", ' '
-    $cleanText = $cleanText -replace "(?i)\b\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:$months)(?:,?\s+20\d{2})?(?:\s*(?:@|at|-)?\s*$time)?\b", ' '
-
-    # Remove common numeric dates, including 24/07, 24-07-2026 and ISO dates.
-    $cleanText = $cleanText -replace '(?<!\d)20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}(?!\d)', ' '
-    $cleanText = $cleanText -replace '(?<!\d)\d{1,2}[-/.]\d{1,2}(?:[-/.](?:20)?\d{2})?(?!\d)', ' '
-
-    # Remove standalone years and season ranges such as 2025, 2025-26 or 2025/26.
-    $cleanText = $cleanText -replace '(?i)\b20\d{2}(?:[-/]\d{2,4})?\b', ' '
-
-    return ($cleanText -replace '\s+', ' ').Trim()
-}
-
-function Get-DailyBreakName {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Title
-    )
-
-    # Daily break names may appear in standard or "Lil" variants. Preserve
-    # the Lil prefix and also recognise Squadz as its own break name.
-    $dailyNameMatch = [regex]::Match(
-        $Title,
-        '(?i)\b(?<lil>Lil\s+)?(?<name>Punterz|Teamz|Squadz|Derby|Slapperz)\b'
-    )
-
-    if (-not $dailyNameMatch.Success) {
-        return $null
+    foreach ($rx in $script:DateRemovalRegexes) {
+        $cleanText = $rx.Replace($cleanText, ' ')
     }
 
-    $name = switch ($dailyNameMatch.Groups['name'].Value.ToLowerInvariant()) {
-        'punterz'  { 'Punterz' }
-        'teamz'    { 'Teamz' }
-        'squadz'   { 'Squadz' }
-        'derby'    { 'Derby' }
-        'slapperz' { 'Slapperz' }
-    }
-
-    if ($dailyNameMatch.Groups['lil'].Success) {
-        return "Lil $name"
-    }
-
-    return $name
-}
-
-function Get-WeeklyBreakName {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Title
-    )
-
-    # Weekly break names are sometimes written loosely. Recognise common
-    # singular/plural and z/s variants.
-    $weeklyNameMatch = [regex]::Match(
-        $Title,
-        '(?i)\b(?<name>Machos?|Spenda(?:s|z)?|Punterz?|Slugger(?:s|z)?|Amigos?)\b'
-    )
-
-    if (-not $weeklyNameMatch.Success) {
-        return $null
-    }
-
-    $rawName = $weeklyNameMatch.Groups['name'].Value.ToLowerInvariant()
-
-    $name = switch -Regex ($rawName) {
-        '^macho'   { 'Machos' }
-        '^spenda'  { 'Spenda' }
-        '^punter'  { 'Punterz' }
-        '^slugger' { 'Sluggerz' }
-        '^amigo'   { 'Amigos' }
-    }
-
-    return $name
+    return $script:MultiWhitespaceRegex.Replace($cleanText, ' ').Trim()
 }
 
 function Get-FullBreakDescription {
     param(
         [Parameter(Mandatory)]
-        [string]$Title
+        [string]$Title,
+
+        [AllowNull()]
+        [string]$ShortName
     )
 
-    $weeklyBreakName = Get-WeeklyBreakName -Title $Title
-    if ($weeklyBreakName) {
-        return $weeklyBreakName
+    if ($ShortName) {
+        return $ShortName
     }
 
-    # The five recurring daily breaks use their established short names.
-    $dailyBreakName = Get-DailyBreakName -Title $Title
-    if ($dailyBreakName) {
-        return $dailyBreakName
-    }
-
-    # Keep the complete product/break description, but omit advertised dates
-    # and metadata that is displayed separately later in the output line.
     $description = Remove-DateText -Text $Title
-
-    # The break number and allocation type are appended separately so they do
-    # not appear twice in the final output.
-    $description = $description -replace '#\d+', ' '
-    $description = $description -replace '(?i)\b(?:Wrestler\s+Team\s+Based|Team\s+Based|Pick\s+Your\s+Wrestlers?|PYW)\b', ' '
-    $description = $description -replace '(?i)\b(?:Pick\s+Your\s+Players?|PYP)\b', ' '
-    $description = $description -replace '(?i)\b(?:Pick\s+Your\s+Teams?|PYT)\b', ' '
-    $description = $description -replace '(?i)\b(?:Random\s+Teams?|RT)\b', ' '
-    $description = $description -replace '(?i)\b(?:Random\s+Wrestlers?|RW)\b', ' '
-    $description = $description -replace '(?i)\b(?:Random\s+Spots?|RS)\b', ' '
-    $description = $description -replace '(?i)\b(?:Random\s+Colou?rs?|RC)\b', ' '
-    $description = $description -replace '(?i)\b(?:Random\s+Players?|RP)\b', ' '
-    $description = $description -replace '(?i)\b(?:Random\s+Packs?|RPk)\b', ' '
-    $description = $description -replace '(?i)\b(?:Random\s+Types?)\b', ' '
-    $description = $description -replace '(?i)\b(?:Types?)\b', ' '
-    $description = $description -replace '(?i)\b(?:Random\s+Characters?)\b', ' '
-    $description = $description -replace '(?i)\b(?:Random\s+Wreslet)\b', ' '
-    $description = $description -replace '(?i)\bOpening\b', ' '
+    $description = $script:DescriptionStripRegex.Replace($description, ' ')
     # A single box is the default, so only display a count for multi-box breaks.
-    $description = $description -replace '(?i)\b1\s*-?\s*Box(?:es)?\b', ' '
-    $description = $description -replace '(?i)\b(?<count>\d+)\s*-?\s*Box(?:es)?\b', '(${count})'
+    $description = $script:SingleBoxRegex.Replace($description, ' ')
+    $description = $script:MultiBoxRegex.Replace($description, '(${count})')
 
-    # Clean separators and whitespace left behind by removed metadata.
-    $middleDot = [regex]::Escape([string][char]0x30FB)
-    $separatorChars = '\-\|' + $middleDot +
-        [regex]::Escape([string][char]0x2013) +
-        [regex]::Escape([string][char]0x2014)
-
-    $description = $description -replace "\s*$middleDot\s*", ' '
-    $description = $description -replace "[\s\p{Zs}]*[$separatorChars]+(?:[\s\p{Zs}]*[$separatorChars]+)*[\s\p{Zs}]*$", ' '
-    $description = $description -replace "^[\s\p{Zs}]*[$separatorChars]+(?:[\s\p{Zs}]*[$separatorChars]+)*[\s\p{Zs}]*", ' '
-    $description = $description -replace '\s+', ' '
-    $description = $description.Trim()
+    $description = $script:MiddleDotRegex.Replace($description, ' ')
+    $description = $script:TrailingSeparatorRegex.Replace($description, ' ')
+    $description = $script:LeadingSeparatorRegex.Replace($description, ' ')
+    $description = $script:MultiWhitespaceRegex.Replace($description, ' ').Trim()
 
     if (-not $description) {
         return 'Break'
@@ -1335,151 +1519,19 @@ function Get-FullBreakDescription {
     return $description
 }
 
-function Test-DailyBreak {
-    param(
-        [Parameter(Mandatory)]
-        [pscustomobject]$Item
-    )
-
-    return $null -ne (Get-DailyBreakName -Title $Item.Title)
-}
-
-function Test-WeeklyBreak {
-    param(
-        [Parameter(Mandatory)]
-        [pscustomobject]$Item
-    )
-
-    return $null -ne (Get-WeeklyBreakName -Title $Item.Title)
-}
-
-function Test-DailyResultBreak {
-    param(
-        [Parameter(Mandatory)]
-        [pscustomobject]$Item
-    )
-
-    return (Test-DailyBreak -Item $Item) -and
-        -not (Test-WeeklyBreak -Item $Item)
-}
-
-function Test-OpenRecurringBreak {
-    param(
-        [Parameter(Mandatory)]
-        [pscustomobject]$Item
-    )
-
-    return $null -ne $Item.SpotsLeft -and
-        $Item.SpotsLeft -gt 0
-}
-
-function Get-SelectedRecurringBreaks {
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [object[]]$Results,
-
-        [switch]$IncludeDailies,
-
-        [switch]$IncludeWeeklies
-    )
-
-    $selectedResults = [System.Collections.Generic.List[object]]::new()
-
-    if ($IncludeDailies) {
-        foreach ($item in @($Results | Where-Object {
-                    (Test-DailyResultBreak -Item $_) -and
-                    (Test-OpenRecurringBreak -Item $_)
-                })) {
-            [void]$selectedResults.Add($item)
-        }
-    }
-
-    if ($IncludeWeeklies) {
-        foreach ($item in @($Results | Where-Object {
-                    (Test-WeeklyBreak -Item $_) -and
-                    (Test-OpenRecurringBreak -Item $_)
-                })) {
-            [void]$selectedResults.Add($item)
-        }
-    }
-
-    return $selectedResults.ToArray()
-}
-
 function Get-BreakSportEmoji {
     param(
         [Parameter(Mandatory)]
         [string]$Title
     )
 
-    # Daily breaks keep the sport of their base name, including all Lil
-    # variants. Squadz is an American-football break whether or not it has Lil.
-    if ($Title -match '(?i)\b(?:Lil\s+)?(?:Punterz|Squadz)\b') {
-        return [char]::ConvertFromUtf32(0x1F3C8) # American football
-    }
-
-    if ($Title -match '(?i)\b(?:Lil\s+)?Teamz\b') {
-        return [char]::ConvertFromUtf32(0x1F3C0) # basketball
-    }
-
-    if ($Title -match '(?i)\b(?:Lil\s+)?Derby\b') {
-        return [char]::ConvertFromUtf32(0x26BE) # baseball
-    }
-
-    if ($Title -match '(?i)\b(?:Lil\s+)?Slapperz\b') {
-        return [char]::ConvertFromUtf32(0x1F3D2) # hockey stick and puck
-    }
-
-    # Check soccer before brand names such as Topps. Topps produces both
-    # baseball and soccer products, so treating every Topps title as baseball
-    # causes soccer breaks to display the baseball emoji.
-    if ($Title -match '(?i)\b(Soccer|EPL|UCL|UEFA|FIFA|Premier League|Champions League|La Liga|LaLiga|Bundesliga|Serie A|Ligue 1|MLS|World Cup|Euro 20\d{2})\b') {
-        return [char]::ConvertFromUtf32(0x26BD) # soccer ball
-    }
-
-    if ($Title -match '(?i)\b(NBA|Basketball)\b') {
-        return [char]::ConvertFromUtf32(0x1F3C0) # basketball
-    }
-
-    if ($Title -match '(?i)\b(NFL|American Football|Gridiron)\b') {
-        return [char]::ConvertFromUtf32(0x1F3C8) # American football
-    }
-
-    if ($Title -match '(?i)\b(NHL|Hockey)\b') {
-        return [char]::ConvertFromUtf32(0x1F3D2) # hockey stick and puck
-    }
-
-    if ($Title -match '(?i)\b(Tennis|ATP|WTA)\b') {
-        return [char]::ConvertFromUtf32(0x1F3BE) # tennis
-    }
-
-    if ($Title -match '(?i)\b(WWE|AEW|MLW|Wrestling|Wrestler|Wrestlers)\b') {
-        return ([char]::ConvertFromUtf32(0x1F93C) + [char]::ConvertFromUtf32(0x200D) + [char]::ConvertFromUtf32(0x2642) + [char]::ConvertFromUtf32(0xFE0F)) # man wrestling
-    }
-
-    if ($Title -match '(?i)\b(MLB|Baseball|Bowman)\b') {
-        return [char]::ConvertFromUtf32(0x26BE) # baseball
+    foreach ($rule in $script:SportEmojiRules) {
+        if ($rule.Regex.IsMatch($Title)) {
+            return $rule.Emoji
+        }
     }
 
     return ''
-}
-
-function Get-DayOpeningsSearchUrl {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Day
-    )
-
-    # Most weekday collections are empty, so search by the date that
-    # product titles use instead, e.g. "Oct 22 Opening".
-    $dateText = (Get-TargetDate -Day $Day).ToString(
-        'MMM d',
-        [Globalization.CultureInfo]::InvariantCulture
-    )
-    $query = [uri]::EscapeDataString("$dateText Opening") -replace '%20', '+'
-
-    return "$BaseUrl/pages/search-results?q=$query"
 }
 
 function Get-DayCollectionLine {
@@ -1488,8 +1540,13 @@ function Get-DayCollectionLine {
         [string]$Day
     )
 
-    return 'Tonights Live Openings (Plz Check Dates) -> {0}' -f `
-        (Get-DayOpeningsSearchUrl -Day $Day)
+    # Most weekday collections are empty, so search by the date product titles use.
+    $dateText = (Get-TargetDate -Day $Day).ToString(
+        'MMM d',
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+    $query = [uri]::EscapeDataString("$dateText Opening") -replace '%20', '+'
+    return "Tonights Live Openings (Plz Check Dates) -> $($script:BaseUrl)/pages/search-results?q=$query"
 }
 
 function Normalize-BreakLine {
@@ -1498,17 +1555,12 @@ function Normalize-BreakLine {
         [string]$Line
     )
 
-    $middleDot = [regex]::Escape([string][char]0x30FB)
-    $separatorChars = '\-\|' +
-        [regex]::Escape([string][char]0x2013) +
-        [regex]::Escape([string][char]0x2014)
-
     $line = $Line.Trim()
-    $line = $line -replace "\s+[$separatorChars]+\s*$middleDot\s*(?=Random\s+President\b)", ' - '
-    $line = $line -replace "\s+[$separatorChars]+\s*$middleDot\s*", ' '
-    $line = $line -replace "\s*$middleDot\s*", ' '
-    $line = $line -replace "\s+[$separatorChars]+\s+(?=(?:\S+\s+)?\((?:\?|\d+)\s+spots\))", ' '
-    $line = $line -replace '\s{2,}', ' '
+    $line = $script:NormalizePresidentRegex.Replace($line, ' - ')
+    $line = $script:NormalizeSepDotRegex.Replace($line, ' ')
+    $line = $script:MiddleDotRegex.Replace($line, ' ')
+    $line = $script:NormalizeBeforeSpotsRegex.Replace($line, ' ')
+    $line = $script:MultiSpaceRegex.Replace($line, ' ')
 
     return $line.Trim()
 }
@@ -1537,13 +1589,13 @@ function Join-BreakLine {
         [string]$UrlText
     )
 
-    $line = ('{0} {1} {2} {3}{4} -> {5}' -f `
+    $line = '{0} {1} {2} {3}{4} -> {5}' -f `
         $Description,
         $SportEmoji,
         $SpotsText,
         $BreakNumber,
         $BreakTypeText,
-        $UrlText)
+        $UrlText
 
     return Normalize-BreakLine -Line $line
 }
@@ -1551,64 +1603,47 @@ function Join-BreakLine {
 function Format-BreakLine {
     param(
         [Parameter(Mandatory)]
-        [pscustomobject]$Item,
+        [string]$Title,
+
+        [Parameter(Mandatory)]
+        [string]$Url,
+
+        [AllowNull()]
+        [Nullable[int]]$SpotsLeft,
+
+        [Parameter(Mandatory)]
+        [string]$Category,
+
+        [AllowNull()]
+        [string]$ShortName,
 
         [switch]$YouTube
     )
 
-    $uri = [uri]$Item.Url
-    $urlText = "https://www.cherrycollectables.com.au$($uri.AbsolutePath)"
     $breakNumber = '#?'
-
-    if ($Item.Title -match '#(?<number>\d+)') {
-        $breakNumber = "#$($Matches['number'])"
+    $numMatch = $script:BreakNumberRegex.Match($Title)
+    if ($numMatch.Success) {
+        $breakNumber = "#$($numMatch.Groups['number'].Value)"
     }
 
-    $description = Get-FullBreakDescription -Title $Item.Title
-    $sportEmoji = Get-BreakSportEmoji -Title $Item.Title
+    $description = Get-FullBreakDescription -Title $Title -ShortName $ShortName
+    $sportEmoji = Get-BreakSportEmoji -Title $Title
+    $isNamedRecurringBreak = $Category -in @('Daily', 'Weekly')
 
-    $isNamedRecurringBreak = (Test-DailyBreak -Item $Item) -or
-        (Test-WeeklyBreak -Item $Item)
-
-    $spotsText = if ($null -eq $Item.SpotsLeft) {
-        if ($isNamedRecurringBreak) {
-            '(? spots left)'
-        }
-        else {
-            '(? spots)'
-        }
+    $spotsText = if ($null -eq $SpotsLeft) {
+        if ($isNamedRecurringBreak) { '(? spots left)' } else { '(? spots)' }
     }
     else {
-        if ($isNamedRecurringBreak) {
-            "($($Item.SpotsLeft) spots left)"
-        }
-        else {
-            "($($Item.SpotsLeft) spots)"
-        }
+        $noun = if ($SpotsLeft -eq 1) { 'spot' } else { 'spots' }
+        if ($isNamedRecurringBreak) { "($SpotsLeft $noun left)" } else { "($SpotsLeft $noun)" }
     }
 
-    # Only show the compact suffix for alternative random allocation types.
-    # For pick-your-spot style breaks, do not append anything.
-    $breakTypeText = if ($Item.Title -match '(?i)\b(?:Random\s+Teams?|RT)\b') {
-        ' - RT'
-    }
-    elseif ($Item.Title -match '(?i)\b(?:Random\s+Wrestlers?|RW)\b') {
-        ' - RW'
-    }
-    elseif ($Item.Title -match '(?i)\b(?:Random\s+Spots?|RS)\b') {
-        ' - RS'
-    }
-    elseif ($Item.Title -match '(?i)\b(?:Random\s+Colou?rs?|RC)\b') {
-        ' - RC'
-    }
-    elseif ($Item.Title -match '(?i)\b(?:Random\s+Players?|RP)\b') {
-        ' - RP'
-    }
-    elseif ($Item.Title -match '(?i)\b(?:Random\s+Packs?|RPk)\b') {
-        ' - RPk'
-    }
-    else {
-        ''
+    $breakTypeText = ''
+    foreach ($rule in $script:AllocationRules) {
+        if ($rule.Regex.IsMatch($Title)) {
+            $breakTypeText = $rule.Suffix
+            break
+        }
     }
 
     $line = Join-BreakLine `
@@ -1617,7 +1652,7 @@ function Format-BreakLine {
         -SpotsText $spotsText `
         -BreakNumber $breakNumber `
         -BreakTypeText $breakTypeText `
-        -UrlText $urlText
+        -UrlText $Url
 
     if ($YouTube -and $line.Length -gt 200) {
         $fixedLine = Join-BreakLine `
@@ -1626,14 +1661,10 @@ function Format-BreakLine {
             -SpotsText $spotsText `
             -BreakNumber $breakNumber `
             -BreakTypeText $breakTypeText `
-            -UrlText $urlText
+            -UrlText $Url
 
         $separatorLength = if ($fixedLine) { 1 } else { 0 }
-        $descriptionLength = 200 - $fixedLine.Length - $separatorLength
-
-        if ($descriptionLength -lt 0) {
-            $descriptionLength = 0
-        }
+        $descriptionLength = [Math]::Max(0, 200 - $fixedLine.Length - $separatorLength)
 
         if ($description.Length -gt $descriptionLength) {
             $description = $description.Substring(0, $descriptionLength).Trim()
@@ -1645,64 +1676,134 @@ function Format-BreakLine {
             -SpotsText $spotsText `
             -BreakNumber $breakNumber `
             -BreakTypeText $breakTypeText `
-            -UrlText $urlText
+            -UrlText $Url
     }
 
     return $line
 }
 
-function Get-BreakResultGroups {
+function ConvertTo-BreakResult {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Product,
+
+        [Parameter(Mandatory)]
+        [pscustomobject]$Classification,
+
+        [switch]$YouTube
+    )
+
+    $line = Format-BreakLine `
+        -Title $Product.Title `
+        -Url $Product.Url `
+        -SpotsLeft $Product.SpotsLeft `
+        -Category $Classification.Category `
+        -ShortName $Classification.ShortName `
+        -YouTube:$YouTube
+
+    return [pscustomobject]@{
+        Title     = $Product.Title
+        Url       = $Product.Url
+        SpotsLeft = $Product.SpotsLeft
+        Category  = $Classification.Category
+        ShortName = $Classification.ShortName
+        IsOpen    = ($null -ne $Product.SpotsLeft -and $Product.SpotsLeft -gt 0)
+        Line      = $line
+    }
+}
+
+function Get-SelectedRecurringBreaks {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Results,
+
+        [switch]$IncludeDailies,
+
+        [switch]$IncludeWeeklies
+    )
+
+    $selected = [System.Collections.Generic.List[object]]::new()
+
+    if ($IncludeDailies) {
+        foreach ($item in $Results) {
+            if ($item.IsOpen -and $item.Category -eq 'Daily') {
+                $selected.Add($item)
+            }
+        }
+    }
+
+    if ($IncludeWeeklies) {
+        foreach ($item in $Results) {
+            if ($item.IsOpen -and $item.Category -eq 'Weekly') {
+                $selected.Add($item)
+            }
+        }
+    }
+
+    return $selected.ToArray()
+}
+
+#endregion
+
+#region Console & Text Output Rendering
+
+function Get-ResultSections {
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
         [object[]]$Results
     )
 
-    $dailyResults = @(
-        $Results |
-            Where-Object { Test-DailyResultBreak -Item $_ }
-    )
+    $dailies = [System.Collections.Generic.List[object]]::new()
+    $weeklies = [System.Collections.Generic.List[object]]::new()
+    $other = [System.Collections.Generic.List[object]]::new()
 
-    $weeklyResults = @(
-        $Results |
-            Where-Object { Test-WeeklyBreak -Item $_ }
-    )
-
-    $otherResults = @(
-        $Results |
-            Where-Object {
-                -not (Test-DailyBreak -Item $_) -and
-                -not (Test-WeeklyBreak -Item $_)
-            }
-    )
-
-    return [pscustomobject]@{
-        Dailies  = $dailyResults
-        Weeklies = $weeklyResults
-        Other    = $otherResults
+    foreach ($item in $Results) {
+        switch ($item.Category) {
+            'Daily'  { $dailies.Add($item); break }
+            'Weekly' { $weeklies.Add($item); break }
+            default  { $other.Add($item); break }
+        }
     }
+
+    $sections = [System.Collections.Generic.List[object]]::new()
+    if ($dailies.Count -gt 0) {
+        $sections.Add([pscustomobject]@{ Title = 'Dailies'; Items = $dailies.ToArray() })
+    }
+    if ($weeklies.Count -gt 0) {
+        $sections.Add([pscustomobject]@{ Title = 'Weeklies'; Items = $weeklies.ToArray() })
+    }
+    if ($other.Count -gt 0) {
+        $sections.Add([pscustomobject]@{ Title = 'Other Breaks'; Items = $other.ToArray() })
+    }
+
+    return $sections.ToArray()
 }
 
 function Write-BreakResultLine {
     param(
         [Parameter(Mandatory)]
-        [pscustomobject]$Item,
-
-        [switch]$YouTube
+        [pscustomobject]$Item
     )
 
-    $statusColour = switch ($Item.SpotsLeft) {
-        0       { 'DarkGray' }
-        { $_ -le 3 }  { 'Red' }
-        { $_ -le 10 } { 'Yellow' }
-        default { 'Green' }
+    $statusColour = if ($null -eq $Item.SpotsLeft) {
+        'Gray'
+    }
+    elseif ($Item.SpotsLeft -le 0) {
+        'DarkGray'
+    }
+    elseif ($Item.SpotsLeft -le 3) {
+        'Red'
+    }
+    elseif ($Item.SpotsLeft -le 10) {
+        'Yellow'
+    }
+    else {
+        'Green'
     }
 
-    $line = Format-BreakLine `
-        -Item $Item `
-        -YouTube:$YouTube
-
-    Write-Host $line -ForegroundColor $statusColour
+    Write-Host $Item.Line -ForegroundColor $statusColour
 }
 
 function Show-BreakResults {
@@ -1714,12 +1815,9 @@ function Show-BreakResults {
         [Parameter(Mandatory)]
         [string]$Day,
 
-        [switch]$YouTube,
-
         [switch]$IncludeDayCollectionLink
     )
 
-    $sydneyDate = Get-SydneyDate
     $targetDate = Get-TargetDate -Day $Day
 
     Write-Host ''
@@ -1727,7 +1825,7 @@ function Show-BreakResults {
         'Cherry break check - {0}, {1} (checked {2})' -f
         $Day,
         $targetDate.ToString('dd MMM yyyy'),
-        $sydneyDate.ToString('dd MMM yyyy HH:mm')
+        $script:SydneyNow.ToString('dd MMM yyyy HH:mm')
     ) -ForegroundColor Cyan
 
     if ($IncludeDayCollectionLink) {
@@ -1741,58 +1839,19 @@ function Show-BreakResults {
         return
     }
 
-    $groups = Get-BreakResultGroups -Results $Results
+    $sections = @(Get-ResultSections -Results $Results)
+    for ($i = 0; $i -lt $sections.Count; $i++) {
+        $section = $sections[$i]
+        Write-Host $section.Title -ForegroundColor Cyan
 
-    if ($groups.Dailies) {
-        Write-Host 'Dailies' -ForegroundColor Cyan
-
-        foreach ($item in $groups.Dailies) {
-            Write-BreakResultLine `
-                -Item $item `
-                -YouTube:$YouTube
+        foreach ($item in $section.Items) {
+            Write-BreakResultLine -Item $item
         }
 
-        if ($groups.Weeklies -or $groups.Other) {
+        if ($i -lt ($sections.Count - 1)) {
             Write-Host ''
         }
     }
-
-    if ($groups.Weeklies) {
-        Write-Host 'Weeklies' -ForegroundColor Cyan
-
-        foreach ($item in $groups.Weeklies) {
-            Write-BreakResultLine `
-                -Item $item `
-                -YouTube:$YouTube
-        }
-
-        if ($groups.Other) {
-            Write-Host ''
-        }
-    }
-
-    if ($groups.Other) {
-        Write-Host 'Other Breaks' -ForegroundColor Cyan
-
-        foreach ($item in $groups.Other) {
-            Write-BreakResultLine `
-                -Item $item `
-                -YouTube:$YouTube
-        }
-    }
-}
-
-function Resolve-OutputPath {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    if ([System.IO.Path]::IsPathRooted($Path)) {
-        return $Path
-    }
-
-    return Join-Path $PSScriptRoot $Path
 }
 
 function Save-TextResults {
@@ -1804,8 +1863,6 @@ function Save-TextResults {
         [Parameter(Mandatory)]
         [string]$Day,
 
-        [switch]$YouTube,
-
         [switch]$IncludeDayCollectionLink
     )
 
@@ -1813,7 +1870,7 @@ function Save-TextResults {
         return
     }
 
-    $resolvedPath = Resolve-OutputPath -Path $OutputPath
+    $resolvedPath = Resolve-ScriptRelativePath -Path $OutputPath
     $targetDate = Get-TargetDate -Day $Day
     $lines = [System.Collections.Generic.List[string]]::new()
 
@@ -1831,85 +1888,36 @@ function Save-TextResults {
         $lines.Add('No matching breaks were found.')
     }
     else {
-        $groups = Get-BreakResultGroups -Results $Results
+        $sections = @(Get-ResultSections -Results $Results)
+        for ($i = 0; $i -lt $sections.Count; $i++) {
+            $section = $sections[$i]
+            $lines.Add($section.Title)
 
-        if ($groups.Dailies) {
-            $lines.Add('Dailies')
-
-            foreach ($item in $groups.Dailies) {
-                $lines.Add(
-                    (Format-BreakLine `
-                        -Item $item `
-                        -YouTube:$YouTube)
-                )
+            foreach ($item in $section.Items) {
+                $lines.Add($item.Line)
             }
 
-            if ($groups.Weeklies -or $groups.Other) {
+            if ($i -lt ($sections.Count - 1)) {
                 $lines.Add('')
-            }
-        }
-
-        if ($groups.Weeklies) {
-            $lines.Add('Weeklies')
-
-            foreach ($item in $groups.Weeklies) {
-                $lines.Add(
-                    (Format-BreakLine `
-                        -Item $item `
-                        -YouTube:$YouTube)
-                )
-            }
-
-            if ($groups.Other) {
-                $lines.Add('')
-            }
-        }
-
-        if ($groups.Other) {
-            $lines.Add('Other Breaks')
-
-            foreach ($item in $groups.Other) {
-                $lines.Add(
-                    (Format-BreakLine `
-                        -Item $item `
-                        -YouTube:$YouTube)
-                )
             }
         }
     }
 
     $directory = Split-Path -Parent $resolvedPath
-
     if ($directory -and -not (Test-Path -LiteralPath $directory)) {
-        New-Item `
-            -ItemType Directory `
-            -Path $directory `
-            -Force |
-            Out-Null
+        $null = New-Item -ItemType Directory -Path $directory -Force
     }
 
-    $lines |
-        Set-Content `
-            -LiteralPath $resolvedPath `
-            -Encoding utf8
+    $lines | Set-Content -LiteralPath $resolvedPath -Encoding utf8
 
     Write-Host (
         "TXT FILE UPDATED SUCCESSFULLY: $resolvedPath ($($Results.Count) result(s), overwritten)"
     ) -ForegroundColor Green
 }
 
-function Get-TwitchChatLine {
-    param(
-        [Parameter(Mandatory)]
-        [pscustomobject]$Item,
+#endregion
 
-        [switch]$YouTube
-    )
-
-    return Format-BreakLine `
-        -Item $Item `
-        -YouTube:$YouTube
-}
+#region Twitch IRC Client
 
 function Get-RedactedTwitchIrcLine {
     param(
@@ -1933,41 +1941,51 @@ function Read-TwitchIrcLines {
         [Parameter(Mandatory)]
         [System.IO.StreamReader]$Reader,
 
+        [System.IO.StreamWriter]$Writer,
+
         [ValidateRange(100, 30000)]
-        [int]$TimeoutMilliseconds = 1000
+        [int]$TimeoutMilliseconds = 1000,
+
+        [scriptblock]$StopWhen
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
-
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
 
     while ([DateTime]::UtcNow -lt $deadline) {
         $remainingMilliseconds = [int][Math]::Max(
-            100,
+            50,
             ($deadline - [DateTime]::UtcNow).TotalMilliseconds
         )
 
         try {
-            $Reader.BaseStream.ReadTimeout = [Math]::Min(
-                1000,
-                $remainingMilliseconds
-            )
-
+            $Reader.BaseStream.ReadTimeout = $remainingMilliseconds
             $line = $Reader.ReadLine()
 
             if ($null -eq $line) {
                 break
             }
 
+            if ($Writer -and $line -match '^PING\s+(?<payload>.+)$') {
+                $pong = "PONG $($Matches['payload'])"
+                Write-Verbose "Twitch IRC -> $pong"
+                $Writer.WriteLine($pong)
+                continue
+            }
+
             $lines.Add($line)
             Write-Verbose "Twitch IRC <- $(Get-RedactedTwitchIrcLine -Line $line)"
+
+            if ($StopWhen -and (& $StopWhen $lines.ToArray())) {
+                break
+            }
         }
         catch [System.IO.IOException] {
             break
         }
     }
 
-    return @($lines)
+    return $lines.ToArray()
 }
 
 function Test-TwitchIrcLoginAccepted {
@@ -1977,14 +1995,12 @@ function Test-TwitchIrcLoginAccepted {
         [string[]]$Lines
     )
 
-    return [bool](
-        $Lines |
-            Where-Object {
-                $_ -match '(^| )001 ' -or
-                $_ -match '^:tmi\.twitch\.tv 001 '
-            } |
-            Select-Object -First 1
-    )
+    foreach ($line in $Lines) {
+        if ($line -match '(^| )001 ' -or $line -match '^:tmi\.twitch\.tv 001 ') {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Get-TwitchIrcFailureLine {
@@ -1994,14 +2010,15 @@ function Get-TwitchIrcFailureLine {
         [string[]]$Lines
     )
 
-    return $Lines |
-        Where-Object {
-            $_ -match 'Login authentication failed' -or
-            $_ -match 'Improperly formatted auth' -or
-            $_ -match 'Error logging in' -or
-            $_ -match '^:tmi\.twitch\.tv NOTICE \* :'
-        } |
-        Select-Object -First 1
+    foreach ($line in $Lines) {
+        if ($line -match 'Login authentication failed' -or
+            $line -match 'Improperly formatted auth' -or
+            $line -match 'Error logging in' -or
+            $line -match '^:tmi\.twitch\.tv NOTICE \* :') {
+            return $line
+        }
+    }
+    return $null
 }
 
 function Test-TwitchIrcJoinAccepted {
@@ -2014,28 +2031,15 @@ function Test-TwitchIrcJoinAccepted {
         [string]$Channel
     )
 
-    return [bool](
-        $Lines |
-            Where-Object {
-                $_ -match " JOIN #$([regex]::Escape($Channel))$" -or
-                $_ -match " ROOMSTATE #$([regex]::Escape($Channel))$" -or
-                $_ -match " 353 .* #$([regex]::Escape($Channel)) :"
-            } |
-            Select-Object -First 1
-    )
-}
-
-function Get-TwitchIrcNoticeLines {
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [string[]]$Lines
-    )
-
-    return @(
-        $Lines |
-            Where-Object { $_ -match ' NOTICE ' }
-    )
+    $escapedChannel = [regex]::Escape($Channel)
+    foreach ($line in $Lines) {
+        if ($line -match " JOIN #$escapedChannel$" -or
+            $line -match " ROOMSTATE #$escapedChannel$" -or
+            $line -match " 353 .* #$escapedChannel :") {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Send-TwitchChatMessages {
@@ -2054,7 +2058,7 @@ function Send-TwitchChatMessages {
         [string[]]$Messages,
 
         [ValidateRange(1, 30)]
-        [int]$DelaySeconds = 2
+        [int]$DelaySeconds = 3
     )
 
     if (-not $Messages) {
@@ -2077,27 +2081,18 @@ function Send-TwitchChatMessages {
 
     try {
         Write-Host "Connecting to Twitch IRC as $cleanUser for #$cleanChannel..." -ForegroundColor Cyan
-        $tcpClient.Connect('irc.chat.twitch.tv', 6697)
 
-        $sslStream = [System.Net.Security.SslStream]::new(
-            $tcpClient.GetStream(),
-            $false,
-            ({ $true } -as [Net.Security.RemoteCertificateValidationCallback])
-        )
+        $connectTask = $tcpClient.ConnectAsync('irc.chat.twitch.tv', 6697)
+        if (-not $connectTask.Wait(10000)) {
+            throw 'Timed out connecting to Twitch IRC (irc.chat.twitch.tv:6697).'
+        }
+        $connectTask.GetAwaiter().GetResult()
 
+        $sslStream = [System.Net.Security.SslStream]::new($tcpClient.GetStream(), $false)
         $sslStream.AuthenticateAsClient('irc.chat.twitch.tv')
 
-        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-
-        $reader = [System.IO.StreamReader]::new(
-            $sslStream,
-            $utf8NoBom
-        )
-
-        $writer = [System.IO.StreamWriter]::new(
-            $sslStream,
-            $utf8NoBom
-        )
+        $reader = [System.IO.StreamReader]::new($sslStream, $script:Utf8NoBom)
+        $writer = [System.IO.StreamWriter]::new($sslStream, $script:Utf8NoBom)
         $writer.NewLine = "`r`n"
         $writer.AutoFlush = $true
 
@@ -2110,10 +2105,15 @@ function Send-TwitchChatMessages {
 
         $loginLines = Read-TwitchIrcLines `
             -Reader $reader `
-            -TimeoutMilliseconds 5000
+            -Writer $writer `
+            -TimeoutMilliseconds 5000 `
+            -StopWhen {
+                param($current)
+                (Test-TwitchIrcLoginAccepted -Lines $current) -or
+                ($null -ne (Get-TwitchIrcFailureLine -Lines $current))
+            }
 
         $failureLine = Get-TwitchIrcFailureLine -Lines $loginLines
-
         if ($failureLine) {
             throw "Twitch IRC login failed: $(Get-RedactedTwitchIrcLine -Line $failureLine)"
         }
@@ -2133,10 +2133,15 @@ function Send-TwitchChatMessages {
 
         $joinLines = Read-TwitchIrcLines `
             -Reader $reader `
-            -TimeoutMilliseconds 5000
+            -Writer $writer `
+            -TimeoutMilliseconds 5000 `
+            -StopWhen {
+                param($current)
+                (Test-TwitchIrcJoinAccepted -Lines $current -Channel $cleanChannel) -or
+                ($null -ne (Get-TwitchIrcFailureLine -Lines $current))
+            }
 
         $joinFailureLine = Get-TwitchIrcFailureLine -Lines $joinLines
-
         if ($joinFailureLine) {
             throw "Twitch IRC join failed: $(Get-RedactedTwitchIrcLine -Line $joinFailureLine)"
         }
@@ -2151,43 +2156,51 @@ function Send-TwitchChatMessages {
             )
         }
 
-        foreach ($message in $Messages) {
+        $delayMs = $DelaySeconds * 1000
+        $noticeTimeoutMs = [Math]::Min(1000, $delayMs)
+        $timer = [System.Diagnostics.Stopwatch]::new()
+
+        for ($i = 0; $i -lt $Messages.Count; $i++) {
+            $message = $Messages[$i]
+            $timer.Restart()
+
             Write-Verbose "Twitch IRC -> PRIVMSG #$cleanChannel :$message"
             $writer.WriteLine("PRIVMSG #$cleanChannel :$message")
 
             $messageResponseLines = Read-TwitchIrcLines `
                 -Reader $reader `
-                -TimeoutMilliseconds 1000
+                -Writer $writer `
+                -TimeoutMilliseconds $noticeTimeoutMs `
+                -StopWhen {
+                    param($current)
+                    foreach ($l in $current) {
+                        if ($l -match ' NOTICE ') { return $true }
+                    }
+                    return $false
+                }
 
-            $noticeLines = Get-TwitchIrcNoticeLines -Lines $messageResponseLines
-
-            if ($noticeLines) {
+            $noticeLines = @($messageResponseLines | Where-Object { $_ -match ' NOTICE ' })
+            if ($noticeLines.Count -gt 0) {
                 foreach ($noticeLine in $noticeLines) {
-                    Write-Warning (
-                        "Twitch IRC notice after message: $(Get-RedactedTwitchIrcLine -Line $noticeLine)"
-                    )
+                    Write-Warning "Twitch IRC notice after message: $(Get-RedactedTwitchIrcLine -Line $noticeLine)"
                 }
             }
             else {
                 Write-Host "Submitted Twitch chat message: $message" -ForegroundColor Green
             }
 
-            Start-Sleep -Seconds ($DelaySeconds)
+            if ($i -lt ($Messages.Count - 1)) {
+                $remainingMs = $delayMs - [int]$timer.ElapsedMilliseconds
+                if ($remainingMs -gt 0) {
+                    Start-Sleep -Milliseconds $remainingMs
+                }
+            }
         }
     }
     finally {
-        if ($null -ne $writer) {
-            $writer.Dispose()
-        }
-
-        if ($null -ne $reader) {
-            $reader.Dispose()
-        }
-
-        if ($null -ne $sslStream) {
-            $sslStream.Dispose()
-        }
-
+        if ($null -ne $writer) { $writer.Dispose() }
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $sslStream) { $sslStream.Dispose() }
         $tcpClient.Dispose()
     }
 }
@@ -2196,30 +2209,19 @@ function Publish-TwitchResults {
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [object[]]$Results,
-
-        [switch]$YouTube
+        [object[]]$Results
     )
 
     if (-not $Twitch) {
         return
     }
 
-    $missingSettings = @()
+    $missingSettings = [System.Collections.Generic.List[string]]::new()
+    if (-not $TwitchChannel) { $missingSettings.Add('TWITCH_CHANNEL') }
+    if (-not $TwitchUser) { $missingSettings.Add('TWITCH_USER') }
+    if (-not $TwitchOAuthToken) { $missingSettings.Add('TWITCH_OAUTH_TOKEN') }
 
-    if (-not $TwitchChannel) {
-        $missingSettings += 'TWITCH_CHANNEL'
-    }
-
-    if (-not $TwitchUser) {
-        $missingSettings += 'TWITCH_USER'
-    }
-
-    if (-not $TwitchOAuthToken) {
-        $missingSettings += 'TWITCH_OAUTH_TOKEN'
-    }
-
-    if ($missingSettings) {
+    if ($missingSettings.Count -gt 0) {
         throw (
             'Twitch sending was requested, but these setting(s) are missing: ' +
             ($missingSettings -join ', ')
@@ -2227,17 +2229,13 @@ function Publish-TwitchResults {
     }
 
     $includeDailies = $Dailies -or -not $Weeklies
-    $messages = @(
+    $selected = @(
         Get-SelectedRecurringBreaks `
             -Results $Results `
             -IncludeDailies:$includeDailies `
-            -IncludeWeeklies:$Weeklies |
-            ForEach-Object {
-                Get-TwitchChatLine `
-                    -Item $_ `
-                    -YouTube:$YouTube
-            }
+            -IncludeWeeklies:$Weeklies
     )
+    $messages = @($selected | ForEach-Object { $_.Line })
 
     Send-TwitchChatMessages `
         -Channel $TwitchChannel `
@@ -2246,6 +2244,10 @@ function Publish-TwitchResults {
         -Messages $messages `
         -DelaySeconds $TwitchMessageDelaySeconds
 }
+
+#endregion
+
+#region Main Entrypoint
 
 function Invoke-BreakCheck {
     $targetDay = Get-TargetDay -RequestedDay $Day
@@ -2258,103 +2260,69 @@ function Invoke-BreakCheck {
     Write-Host 'Checking all breaks...' -ForegroundColor Cyan
 
     try {
-        $productLinkSet = [System.Collections.Generic.HashSet[string]]::new(
-            [System.StringComparer]::OrdinalIgnoreCase
-        )
+        $products = @(Get-CollectionProducts)
+        $matchedCount = 0
 
-        # Load the breaks collection from Shopify products.json.
-        # This returns all active breaks and seeds the product cache in one call.
-        $fallbackCollectionUrl = Get-UnfilteredCollectionUrl
-        Write-Verbose (
-            "Checking unfiltered collection for breaks matching " +
-            "$targetDay`: $fallbackCollectionUrl"
-        )
+        foreach ($product in $products) {
+            $classification = Get-BreakClassification -Title $product.Title
+            $isWeeklySearchMatch = $Weeklies -and ($classification.Category -eq 'Weekly')
 
-        $fallbackProductLinks = @(
-            Get-ProductLinks `
-                -CollectionUrl $fallbackCollectionUrl
-        )
-
-        # Candidate products are already cached from products.json.
-        Read-ProductJsonIntoCache `
-            -ProductUrls $fallbackProductLinks
-
-        foreach ($productUrl in $fallbackProductLinks) {
-            if ($Weeklies -or
-                (Test-ProductMatchesDayFallback `
-                    -ProductUrl $productUrl `
-                    -Day $targetDay `
-                    -TargetDate $targetDate)) {
-                [void]$productLinkSet.Add($productUrl)
-            }
-        }
-
-        $productLinks = @($productLinkSet | Sort-Object)
-
-        Write-Host (
-            "Found $($productLinks.Count) product link(s)."
-        )
-
-        foreach ($productUrl in $productLinks) {
-            $break = Get-CherryBreak `
-                -ProductUrl $productUrl
-
-            $isWeeklySearchMatch = $Weeklies -and
-                (Test-WeeklyBreak -Item $break)
-            $titleDate = Get-TextBreakDate -Text $break.Title
-
-            if (-not $isWeeklySearchMatch -and
-                $titleDate -and
-                $titleDate -ne $targetDate.Date) {
-                Write-Verbose (
-                    "Skipping '$($break.Title)' because its title date " +
-                    "$($titleDate.ToString('dd MMM yyyy')) does not match " +
-                    "$($targetDate.ToString('dd MMM yyyy'))."
-                )
-
-                continue
-            }
-
-            if (-not $isWeeklySearchMatch -and -not $titleDate) {
-                $uri = [uri]$productUrl
-                $urlDate = Get-TextBreakDate -Text $uri.AbsolutePath
-
-                if ($urlDate -and $urlDate -ne $targetDate.Date) {
-                    Write-Verbose (
-                        "Skipping '$($break.Title)' because its URL date " +
-                        "$($urlDate.ToString('dd MMM yyyy')) does not match " +
-                        "$($targetDate.ToString('dd MMM yyyy'))."
-                    )
-
-                    continue
+            if (-not $isWeeklySearchMatch) {
+                $titleDate = Get-TextBreakDate -Text $product.Title
+                if ($titleDate) {
+                    if ($titleDate -ne $targetDate.Date) {
+                        Write-Verbose (
+                            "Skipping '$($product.Title)' because its title date " +
+                            "$($titleDate.ToString('dd MMM yyyy')) does not match " +
+                            "$($targetDate.ToString('dd MMM yyyy'))."
+                        )
+                        continue
+                    }
+                }
+                else {
+                    $handleDate = Get-TextBreakDate -Text $product.Handle
+                    if (-not $handleDate -or $handleDate -ne $targetDate.Date) {
+                        if ($handleDate) {
+                            Write-Verbose (
+                                "Skipping '$($product.Title)' because its URL date " +
+                                "$($handleDate.ToString('dd MMM yyyy')) does not match " +
+                                "$($targetDate.ToString('dd MMM yyyy'))."
+                            )
+                        }
+                        continue
+                    }
                 }
             }
 
-            [void]$results.Add($break)
+            $matchedCount++
+            $results.Add((ConvertTo-BreakResult `
+                -Product $product `
+                -Classification $classification `
+                -YouTube:$YouTube))
         }
+
+        Write-Host "Found $matchedCount matching product(s) out of $($products.Count) total."
     }
     catch {
         $checkAborted = $true
         $msg = $_.Exception.Message
+        $kind = Get-ExceptionKind -Exception $_.Exception
 
-        if ($msg -like 'Rate limited*' -or $msg -match '\b429\b') {
+        if ($kind -eq 'RateLimited' -or $msg -match '\b429\b') {
             Write-Host ''
             Write-Host "Rate limit reached (HTTP 429): $msg" -ForegroundColor Red
             Write-Host 'Shopify storefront edge is rate limiting requests from this IP.' -ForegroundColor Yellow
             Write-Host 'Please wait a few minutes before trying again to allow the rate limit window to reset.' -ForegroundColor Yellow
             Write-Host ''
         }
-        elseif ($msg -like 'Access blocked*' -or $msg -match '\b403\b') {
+        elseif ($kind -eq 'Blocked' -or $msg -match '\b403\b') {
             Write-Host ''
             Write-Host "Access blocked (HTTP 403): $msg" -ForegroundColor Red
             Write-Host 'Cloudflare / Shopify bot protection blocked automated requests to the collection.' -ForegroundColor Yellow
             Write-Host ''
         }
         else {
-            Write-Warning (
-                "Could not check breaks collection: " +
-                $msg
-            )
+            Write-Warning "Could not check breaks collection: $msg"
         }
     }
 
@@ -2382,18 +2350,14 @@ function Invoke-BreakCheck {
     Show-BreakResults `
         -Results $allResults `
         -Day $targetDay `
-        -YouTube:$YouTube `
         -IncludeDayCollectionLink:$DayWasExplicitlyRequested
 
     Save-TextResults `
         -Results $allResults `
         -Day $targetDay `
-        -YouTube:$YouTube `
         -IncludeDayCollectionLink:$DayWasExplicitlyRequested
 
-    Publish-TwitchResults `
-        -Results $allResults `
-        -YouTube:$YouTube
+    Publish-TwitchResults -Results $allResults
 
     return $allResults
 }
@@ -2404,3 +2368,5 @@ try {
 catch {
     Write-Error "Break check failed: $($_.Exception.Message)"
 }
+
+#endregion
