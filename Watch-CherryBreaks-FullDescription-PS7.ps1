@@ -911,25 +911,25 @@ function Get-CollectionProductsViaPlaywright {
         return $null
     }
 
-    $playwrightEntry = Join-Path $PSScriptRoot 'node_modules/playwright-core/index.mjs'
+    $playwrightEntry = Join-Path $PSScriptRoot 'node_modules' 'playwright-core' 'index.mjs'
     if (-not (Test-Path -LiteralPath $playwrightEntry)) {
-        $playwrightEntry = Join-Path $PSScriptRoot 'node_modules/playwright-core/index.js'
+        $playwrightEntry = Join-Path $PSScriptRoot 'node_modules' 'playwright-core' 'index.js'
         if (-not (Test-Path -LiteralPath $playwrightEntry)) {
             return $null
         }
     }
 
     $profileDir = Join-Path $PSScriptRoot '.browser-profile'
-    $args = [System.Collections.Generic.List[string]]::new()
-    $args.Add('--input-type=module')
-    $args.Add('-')
-    $args.Add($playwrightEntry)
-    $args.Add($script:ProductsJsonBaseUrl)
-    $args.Add($profileDir)
-    $args.Add([string]$MaximumPages)
-    $args.Add([string]$TimeoutSeconds)
+    $nodeArgs = [System.Collections.Generic.List[string]]::new()
+    $nodeArgs.Add('--input-type=module')
+    $nodeArgs.Add('-')
+    $nodeArgs.Add($playwrightEntry)
+    $nodeArgs.Add($script:ProductsJsonBaseUrl)
+    $nodeArgs.Add($profileDir)
+    $nodeArgs.Add([string]$MaximumPages)
+    $nodeArgs.Add([string]$TimeoutSeconds)
     if ($Headed) {
-        $args.Add('--headed')
+        $nodeArgs.Add('--headed')
     }
 
     Write-Verbose "Loading collection products JSON via Node + Playwright ($($script:ProductsJsonBaseUrl))."
@@ -937,7 +937,7 @@ function Get-CollectionProductsViaPlaywright {
     $processTimeoutMs = [Math]::Min(600000, ($MaximumPages * $TimeoutSeconds + 30) * 1000)
     $procResult = Invoke-ExternalProcess `
         -FilePath $nodePath `
-        -Arguments $args.ToArray() `
+        -Arguments $nodeArgs.ToArray() `
         -StandardInput $script:PlaywrightPaginatorScript `
         -TimeoutMilliseconds $processTimeoutMs
 
@@ -1014,7 +1014,7 @@ function Get-CollectionProductsViaNativeBrowser {
             -Message 'Browser fallback unavailable: no Edge or Chrome found.')
     }
 
-    $profileDir = Join-Path $PSScriptRoot '.browser-profile/native'
+    $profileDir = Join-Path $PSScriptRoot '.browser-profile' 'native'
     $null = New-Item -ItemType Directory -Force -Path $profileDir
 
     $allProducts = [System.Collections.Generic.List[object]]::new()
@@ -1023,27 +1023,69 @@ function Get-CollectionProductsViaNativeBrowser {
         $pageUrl = "$($script:ProductsJsonBaseUrl)&page=$page"
         Write-Verbose "Loading '$pageUrl' in $browser (headless)."
 
-        $browserArgs = @(
-            '--headless=new',
-            '--disable-gpu',
-            '--no-first-run',
-            '--no-default-browser-check',
-            "--user-data-dir=$profileDir",
-            '--virtual-time-budget=20000',
-            '--dump-dom',
-            $pageUrl
-        )
+        if ($IsWindows) {
+            # Edge/Chrome are GUI-subsystem programs on Windows; Start-Process -Wait with
+            # file redirection both waits for completion and captures stdout reliably.
+            $outFile = [System.IO.Path]::GetTempFileName()
+            $errFile = [System.IO.Path]::GetTempFileName()
+            try {
+                $browserArgs = @(
+                    '--headless=new',
+                    '--disable-gpu',
+                    '--no-first-run',
+                    '--no-default-browser-check',
+                    "--user-data-dir=`"$profileDir`"",
+                    '--virtual-time-budget=20000',
+                    '--dump-dom',
+                    "`"$pageUrl`""
+                )
+                $proc = Start-Process -FilePath $browser -ArgumentList $browserArgs `
+                    -Wait -PassThru -NoNewWindow `
+                    -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+                $exitCode = if ($null -ne $proc) { $proc.ExitCode } else { 0 }
+                $dom = if (Test-Path -LiteralPath $outFile) {
+                    [System.IO.File]::ReadAllText($outFile, $script:Utf8NoBom)
+                }
+                else {
+                    ''
+                }
+                $errText = if (Test-Path -LiteralPath $errFile) {
+                    [System.IO.File]::ReadAllText($errFile, $script:Utf8NoBom)
+                }
+                else {
+                    ''
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+        else {
+            $browserArgs = @(
+                '--headless=new',
+                '--disable-gpu',
+                '--no-first-run',
+                '--no-default-browser-check',
+                "--user-data-dir=$profileDir",
+                '--virtual-time-budget=20000',
+                '--dump-dom',
+                $pageUrl
+            )
+            $procResult = Invoke-ExternalProcess `
+                -FilePath $browser `
+                -Arguments $browserArgs `
+                -TimeoutMilliseconds 60000
+            $exitCode = $procResult.ExitCode
+            $dom = if ($procResult.StdOut) { $procResult.StdOut } else { '' }
+            $errText = if ($procResult.StdErr) { $procResult.StdErr } else { '' }
+        }
 
-        $procResult = Invoke-ExternalProcess `
-            -FilePath $browser `
-            -Arguments $browserArgs `
-            -TimeoutMilliseconds 60000
-
-        $dom = if ($procResult.StdOut) { $procResult.StdOut } else { '' }
         if (-not $dom.Trim()) {
+            $errSnippet = Get-BodySnippet -Text $errText
+            $errSuffix = if ($errSnippet) { " Stderr: $errSnippet" } else { '' }
             throw (New-CherryRequestException `
                 -Kind 'BrowserUnavailable' `
-                -Message "Browser fallback failed (exit $($procResult.ExitCode)): $browser produced no output.")
+                -Message "Browser fallback failed (exit $exitCode): $browser produced no output.$errSuffix")
         }
 
         if ($dom -match '<title>[^<]*(Verifying|Just a moment|Attention Required)') {
