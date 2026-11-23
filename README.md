@@ -33,91 +33,72 @@ Topps Chrome Delight Baseball ⚾ (9 spots) #32911 -> https://www.cherrycollecta
 Immaculate Baseball ⚾ (28 spots) #32929 - RT -> https://www.cherrycollectables.com.au/products/...
 ```
 
-## Script
-
-`Watch-CherryBreaks-FullDescription-PS7.ps1` is the recommended script for PowerShell 7+. It
-loads the collection from Shopify's `products.json` (about one request per 250
-products, which also supplies every product's title and availability so it needs no
-per-product requests) using a real browser by default to pass Cloudflare challenges,
-or native `curl` / `Invoke-WebRequest` when `-NoBrowser` is used.
-
-The original `Watch-CherryBreaks-FullDescription.ps1` is also kept for Windows PowerShell 5.1. It uses the
-HTML collection pages and has no 429 handling.
-
-- Because `products.json` cannot apply the site's day filter, breaks are matched
-  to the day by the date in their title or URL.
-- Spots left are counted from available variants. Shopify's CDN may cache the
-  JSON briefly, so a spot that just sold can take a moment to show.
-- Run with `-Verbose` to see diagnostic information such as which source was used.
-- It detects HTTP 429 (rate limited) and 403 (blocked). It halts immediately instead
-  of cascading into more requests, and advises how long to wait so the IP block can reset.
-- On a 403 or 429 it prints block diagnostics: the status line, key headers
-  (`cf-mitigated`, `cf-ray`, `server`, `retry-after`), a body snippet, and the
-  likely cause (for example a Cloudflare managed challenge). Cookie values are redacted.
-
-## Cloudflare Challenges and the Browser Fallback
-
-Cherry Collectables sits behind Cloudflare, which intermittently serves a managed
-challenge (`HTTP 403`, `cf-mitigated: challenge`) to non-browser clients such as
-curl. No header tweak gets past it, and it affects every path, including
-`products.json` and the sitemaps. It is separate from the 429 rate limit, which a
-browser does not avoid.
-
-By default the script loads every request in a real browser, which passes the
-challenge. Nothing has to be installed on Windows 11:
-
-1. **System Edge/Chrome (no install).** The script drives the Edge or Chrome
-   already on the machine over Chrome DevTools Protocol (`--remote-debugging-port`)
-   in a single headless session, waits for any Cloudflare challenge to resolve,
-   and fetches all collection pages without per-page browser restarts. Clearance
-   cookies are kept in `.browser-profile/native` beside the script (falling back
-   to a temporary profile automatically if `.browser-profile/native` is locked). On
-   Windows, Edge prints `DevTools listening on ws://127.0.0.1:...` to show the
-   browser session is active. Verified working on Windows 11 with Edge.
-2. **Node + Playwright (optional).** If Node.js 20+ is installed and `npm install`
-   has been run in the script folder, `Watch-CherryBreaks-FullDescription-PS7.ps1`
-   runs an embedded single-session Playwright paginator directly (fetching all
-   collection pages in one browser session and reusing `.browser-profile` cookies,
-   with no separate `browser-fetch.mjs` process per page). It also works on macOS
-   and Linux. If no Chrome/Edge is installed, download Playwright's browser with
-   `npx playwright-core install chromium-headless-shell` (no sudo; verified in WSL).
-   Only if it then fails to start on Linux, run
-   `sudo npx playwright install-deps chromium`.
-
-If the browser cannot run at all, the script warns once and uses curl for the rest of
-the run.
-
-Switches:
-
-- `-NoBrowser` uses curl / `Invoke-WebRequest` only. It is faster but gets a 403 whenever
-  Cloudflare challenges the request.
-- `-UseBrowser` is accepted for compatibility; the browser is already the default.
-- `-Headed` shows the browser window (works with both system Edge/Chrome and Node + Playwright).
-
-If the browser cannot get through, the error says why (for example, a Cloudflare
-page title, or the JSON it received instead of `products`).
-
-Please keep request volume low and check Cherry Collectables' terms; asking them for
-an official feed or allowlisting is the most reliable fix.
-
-### Windows: "file is not digitally signed"
-
-A script downloaded from the internet is blocked by the default execution policy.
-Unblock it once, or bypass for a single run:
-
-```powershell
-Unblock-File .\Watch-CherryBreaks-FullDescription-PS7.ps1
-pwsh -ExecutionPolicy Bypass -File .\Watch-CherryBreaks-FullDescription-PS7.ps1
-```
-
-Run it from PowerShell 7 (`pwsh`), not Windows PowerShell 5.1.
-
 ## Requirements
 
 - PowerShell 7.0 or later (`pwsh`)
+- Microsoft Edge or Google Chrome (Edge is built into Windows 11; Node.js 20+ and
+  `npm install` are optional for Playwright on macOS/Linux/WSL)
 - Internet access to `cherrycollectables.com.au`
-- Recommended: `curl.exe` / `curl` 7.66 or newer (included with Windows 10/11 and Linux)
-- For the Cloudflare browser fallback: Microsoft Edge or Google Chrome (Edge is built into Windows 11). Node.js 20+ and `npm install` are optional.
+- Optional: `curl.exe` / `curl` 7.66+ (only used with `-NoBrowser` or if no browser is available)
+
+## Quick Start (Windows)
+
+Run from **PowerShell 7 (`pwsh`)**, not Windows PowerShell 5.1:
+
+```powershell
+# Download the script (or run git pull if you cloned the repo)
+Invoke-WebRequest "https://raw.githubusercontent.com/Jeff8247/Cherry-Breaks-Links/main/Watch-CherryBreaks-FullDescription-PS7.ps1" -OutFile .\Watch-CherryBreaks-FullDescription-PS7.ps1
+
+# Unblock a script downloaded from the internet, then run
+Unblock-File .\Watch-CherryBreaks-FullDescription-PS7.ps1
+.\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday
+```
+
+If your execution policy still blocks unsigned scripts, run with:
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File .\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday
+```
+
+## How It Works (Browser-First Fetching)
+
+`Watch-CherryBreaks-FullDescription-PS7.ps1` loads Shopify's `products.json`
+(about one request per 250 products, supplying every break's title and variant
+availability with no per-product requests) in a **real browser by default** so it
+passes Cloudflare managed challenges and avoids stricter CLI/bot throttling:
+
+1. **Node + Playwright (when installed).** If Node.js 20+ is installed and
+   `npm install` has been run in the script folder, the script launches an
+   embedded single-session Playwright paginator reusing `.browser-profile` cookies.
+   On headless Linux/WSL with no Chrome/Edge installed, download Playwright's
+   browser via `npx playwright-core install chromium-headless-shell` (and
+   `sudo npx playwright install-deps chromium` only if needed).
+2. **System Edge/Chrome via CDP (zero install, default on Windows 11).** Otherwise,
+   the script drives installed Edge or Chrome over Chrome DevTools Protocol
+   (`--remote-debugging-port`) in a single headless session, fetches all collection
+   pages without per-page browser restarts, and saves clearance cookies in
+   `.browser-profile/native` (falling back to a temporary profile automatically if
+   `.browser-profile/native` is locked). On Windows, Edge prints
+   `DevTools listening on ws://127.0.0.1:...` to confirm the browser session is active.
+3. **HTTP fallback (`curl` / `Invoke-WebRequest`).** Used only when `-NoBrowser` is
+   passed or if no supported browser can run (warns once and falls back for that run).
+
+Notes & browser switches:
+
+- Because `products.json` cannot apply the site's day filter, breaks are matched to
+  the selected day by the date in their title or URL.
+- Spots left are counted from available variants (Shopify's CDN may cache the JSON
+  briefly after a spot sells).
+- Run with `-Verbose` to inspect skipped items and transport details.
+- `-Headed` shows the browser window (works with both system Edge/Chrome and Node + Playwright).
+- `-NoBrowser` skips the browser and uses `curl` / `Invoke-WebRequest` directly (faster,
+  but more likely to hit Cloudflare 403 challenges or Shopify 429 rate limits).
+- `-UseBrowser` is accepted for compatibility (browser mode is already the default).
+- On HTTP `403` or `429`, the script halts immediately instead of retrying/cascading
+  requests and prints redacted header/body diagnostics. Excessive request volume can
+  still trigger `429` even in a browser; keep runs reasonable.
+- Legacy `Watch-CherryBreaks-FullDescription.ps1` is also kept in the repo as an
+  older Windows PowerShell 5.1 HTML-scraping backup (no `429` handling).
 
 ## Usage
 
@@ -167,6 +148,8 @@ Show selected-day Dailies plus broader Weeklies:
 ```powershell
 .\Watch-CherryBreaks-FullDescription-PS7.ps1 -Day Monday -Dailies -Weeklies
 ```
+
+### YouTube Formatting
 
 Create YouTube-friendly output capped at 200 characters per break line:
 
