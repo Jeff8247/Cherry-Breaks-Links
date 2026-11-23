@@ -569,6 +569,144 @@ function Get-CherryBlockDiagnostics {
 
 #region Collection Fetching & JsonDocument Parsing
 
+function Get-ProductSpotsFromJsonElement {
+    param(
+        [Parameter(Mandatory)]
+        [System.Text.Json.JsonElement]$ProductElement
+    )
+
+    $prop = [System.Text.Json.JsonElement]::new()
+    $variantsEl = [System.Text.Json.JsonElement]::new()
+
+    if (-not $ProductElement.TryGetProperty('variants', [ref]$variantsEl) -or
+        $variantsEl.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+        return [pscustomobject]@{
+            SpotsLeft      = 0
+            HasInventory   = $true
+            VariantCount   = 0
+            AvailableCount = 0
+        }
+    }
+
+    $variantCount = 0
+    $availableCount = 0
+    $inventorySum = 0
+    $hasInventory = $false
+
+    foreach ($varEl in $variantsEl.EnumerateArray()) {
+        if ($varEl.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+            continue
+        }
+
+        $variantCount++
+
+        if (-not $varEl.TryGetProperty('available', [ref]$prop) -or
+            $prop.ValueKind -ne [System.Text.Json.JsonValueKind]::True) {
+            continue
+        }
+
+        $availableCount++
+        if ($varEl.TryGetProperty('inventory_quantity', [ref]$prop) -and
+            $prop.ValueKind -eq [System.Text.Json.JsonValueKind]::Number) {
+            $qty = 0
+            if ($prop.TryGetInt32([ref]$qty) -and $qty -gt 0) {
+                $hasInventory = $true
+                $inventorySum += $qty
+            }
+        }
+    }
+
+    if ($availableCount -eq 0) {
+        return [pscustomobject]@{
+            SpotsLeft      = 0
+            HasInventory   = $true
+            VariantCount   = $variantCount
+            AvailableCount = 0
+        }
+    }
+
+    $spotsLeft = if ($hasInventory) {
+        $inventorySum
+    }
+    elseif ($variantCount -eq 1) {
+        $null
+    }
+    else {
+        $availableCount
+    }
+
+    return [pscustomobject]@{
+        SpotsLeft      = $spotsLeft
+        HasInventory   = $hasInventory
+        VariantCount   = $variantCount
+        AvailableCount = $availableCount
+    }
+}
+
+function Get-ProductSpotsFromJsonText {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$JsonText
+    )
+
+    $doc = $null
+    try {
+        $doc = [System.Text.Json.JsonDocument]::Parse($JsonText)
+        if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+            return $null
+        }
+        return Get-ProductSpotsFromJsonElement -ProductElement $doc.RootElement
+    }
+    catch {
+        return $null
+    }
+    finally {
+        if ($null -ne $doc) {
+            $doc.Dispose()
+        }
+    }
+}
+
+function Select-ProductsForInventoryLookup {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Products,
+
+        [int]$MultiVariantLimit = 50
+    )
+
+    $singleVariant = [System.Collections.Generic.List[object]]::new()
+    $multiVariant = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($p in $Products) {
+        if ($p.AvailableCount -le 0 -or $p.HasInventory) {
+            continue
+        }
+
+        if ($p.VariantCount -eq 1) {
+            $singleVariant.Add($p)
+        }
+        else {
+            $multiVariant.Add($p)
+        }
+    }
+
+    $selected = [System.Collections.Generic.List[object]]::new()
+    foreach ($p in $singleVariant) {
+        $selected.Add($p)
+    }
+
+    if (($singleVariant.Count + $multiVariant.Count) -le $MultiVariantLimit) {
+        foreach ($p in $multiVariant) {
+            $selected.Add($p)
+        }
+    }
+
+    return $selected.ToArray()
+}
+
 function ConvertFrom-ProductsJson {
     param(
         [Parameter(Mandatory)]
@@ -602,7 +740,6 @@ function ConvertFrom-ProductsJson {
         $products = [System.Collections.Generic.List[object]]::new()
         $rawCount = 0
         $prop = [System.Text.Json.JsonElement]::new()
-        $variantsEl = [System.Text.Json.JsonElement]::new()
 
         foreach ($prodEl in $productsElement.EnumerateArray()) {
             $rawCount++
@@ -626,50 +763,16 @@ function ConvertFrom-ProductsJson {
                 $title = $prop.GetString()
             }
 
-            $spotsLeft = 0
-            if ($prodEl.TryGetProperty('variants', [ref]$variantsEl) -and
-                $variantsEl.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
-                $availableCount = 0
-                $inventorySum = 0
-                $hasInventory = $false
-
-                foreach ($varEl in $variantsEl.EnumerateArray()) {
-                    if ($varEl.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
-                        continue
-                    }
-
-                    if (-not $varEl.TryGetProperty('available', [ref]$prop) -or
-                        $prop.ValueKind -ne [System.Text.Json.JsonValueKind]::True) {
-                        continue
-                    }
-
-                    $availableCount++
-                    if ($varEl.TryGetProperty('inventory_quantity', [ref]$prop) -and
-                        $prop.ValueKind -eq [System.Text.Json.JsonValueKind]::Number) {
-                        $qty = 0
-                        if ($prop.TryGetInt32([ref]$qty)) {
-                            $hasInventory = $true
-                            $inventorySum += $qty
-                        }
-                    }
-                }
-
-                $spotsLeft = if ($availableCount -eq 0) {
-                    0
-                }
-                elseif ($hasInventory) {
-                    $inventorySum
-                }
-                else {
-                    $availableCount
-                }
-            }
+            $spotInfo = Get-ProductSpotsFromJsonElement -ProductElement $prodEl
 
             $products.Add([pscustomobject]@{
-                Handle    = $handle
-                Title     = $title
-                Url       = "$($script:BaseUrl)/products/$handle"
-                SpotsLeft = $spotsLeft
+                Handle         = $handle
+                Title          = $title
+                Url            = "$($script:BaseUrl)/products/$handle"
+                SpotsLeft      = $spotInfo.SpotsLeft
+                HasInventory   = $spotInfo.HasInventory
+                VariantCount   = $spotInfo.VariantCount
+                AvailableCount = $spotInfo.AvailableCount
             })
         }
 
@@ -708,17 +811,79 @@ function snippet(text, limit = 300) {
 function countSpots(product) {
   const variants = Array.isArray(product?.variants) ? product.variants : [];
   const available = variants.filter((v) => v && v.available === true);
-  if (available.length === 0) return 0;
+  if (available.length === 0) {
+    return { spotsLeft: 0, hasInventory: true, variantCount: variants.length, availableCount: 0 };
+  }
 
   let spots = 0;
   let hasInventory = false;
   for (const v of available) {
-    if (typeof v.inventory_quantity === 'number' && Number.isFinite(v.inventory_quantity)) {
+    if (typeof v.inventory_quantity === 'number' && Number.isFinite(v.inventory_quantity) && v.inventory_quantity > 0) {
       hasInventory = true;
       spots += Math.trunc(v.inventory_quantity);
     }
   }
-  return hasInventory ? spots : available.length;
+  const spotsLeft = hasInventory ? spots : (variants.length === 1 ? null : available.length);
+  return { spotsLeft, hasInventory, variantCount: variants.length, availableCount: available.length };
+}
+
+async function enrichSpotsFromProductJs(page, products) {
+  const singleVariant = products.filter((p) => p.availableCount > 0 && !p.hasInventory && p.variantCount === 1);
+  const multiVariant = products.filter((p) => p.availableCount > 0 && !p.hasInventory && p.variantCount > 1);
+  const targets = (singleVariant.length + multiVariant.length) <= 50
+    ? [...singleVariant, ...multiVariant]
+    : singleVariant;
+
+  if (targets.length === 0) return;
+
+  const handles = [...new Set(targets.map((p) => p.handle))];
+  const spotsByHandle = await page.evaluate(async (handleList) => {
+    const results = {};
+    let rateLimited = false;
+    for (let i = 0; i < handleList.length && !rateLimited; i += 5) {
+      const batch = handleList.slice(i, i + 5);
+      await Promise.all(batch.map(async (handle) => {
+        try {
+          const r = await fetch(`/products/${encodeURIComponent(handle)}.js`, {
+            credentials: 'include',
+            headers: { Accept: 'application/json' }
+          });
+          if (r.status === 429) {
+            rateLimited = true;
+            return;
+          }
+          if (!r.ok) return;
+          const data = await r.json();
+          const variants = Array.isArray(data?.variants) ? data.variants : [];
+          const available = variants.filter((v) => v && v.available === true);
+          if (available.length === 0) {
+            results[handle] = 0;
+            return;
+          }
+          let spots = 0;
+          let hasInventory = false;
+          for (const v of available) {
+            if (typeof v.inventory_quantity === 'number' && Number.isFinite(v.inventory_quantity) && v.inventory_quantity > 0) {
+              hasInventory = true;
+              spots += Math.trunc(v.inventory_quantity);
+            }
+          }
+          if (hasInventory) {
+            results[handle] = spots;
+          }
+        } catch {
+          // Keep fallback spotsLeft on individual fetch errors.
+        }
+      }));
+    }
+    return results;
+  }, handles);
+
+  for (const p of products) {
+    if (Object.prototype.hasOwnProperty.call(spotsByHandle, p.handle)) {
+      p.spotsLeft = spotsByHandle[p.handle];
+    }
+  }
 }
 
 async function launch(chromium) {
@@ -870,21 +1035,27 @@ try {
 
       for (const p of parsed.products) {
         if (p && typeof p.handle === 'string' && p.handle.length > 0) {
+          const spotInfo = countSpots(p);
           allProducts.push({
             handle: p.handle,
             title: typeof p.title === 'string' ? p.title : '',
-            spotsLeft: countSpots(p)
+            spotsLeft: spotInfo.spotsLeft,
+            hasInventory: spotInfo.hasInventory,
+            variantCount: spotInfo.variantCount,
+            availableCount: spotInfo.availableCount
           });
         }
       }
 
-      if (parsed.products.length < 250) {
-        emit({ status: 200, challenged: false, products: allProducts }, 0);
+      if (parsed.products.length < 250 || pageNum === maxPages) {
+        await enrichSpotsFromProductJs(page, allProducts);
+        const outputProducts = allProducts.map((p) => ({
+          handle: p.handle,
+          title: p.title,
+          spotsLeft: p.spotsLeft
+        }));
+        emit({ status: 200, challenged: false, products: outputProducts }, 0);
         break;
-      }
-
-      if (pageNum === maxPages) {
-        emit({ status: 200, challenged: false, products: allProducts }, 0);
       }
     }
   }
@@ -997,7 +1168,7 @@ function Get-CollectionProductsViaPlaywright {
                 Handle    = [string]$p.handle
                 Title     = [string]$p.title
                 Url       = "$($script:BaseUrl)/products/$($p.handle)"
-                SpotsLeft = [int]$p.spotsLeft
+                SpotsLeft = if ($null -ne $p.spotsLeft) { [int]$p.spotsLeft } else { $null }
             })
         }
     }
@@ -1648,6 +1819,80 @@ function Get-CollectionProductsViaNativeBrowser {
                 break
             }
         }
+
+        $lookupTargets = @(Select-ProductsForInventoryLookup -Products $allProducts.ToArray())
+        if ($lookupTargets.Count -gt 0) {
+            $handlesJson = ConvertTo-Json -InputObject @($lookupTargets | ForEach-Object { $_.Handle } | Select-Object -Unique) -Compress
+            $enrichExpr = @"
+(async () => {
+  const handles = $handlesJson;
+  const results = {};
+  let rateLimited = false;
+  for (let i = 0; i < handles.length && !rateLimited; i += 5) {
+    const batch = handles.slice(i, i + 5);
+    await Promise.all(batch.map(async (handle) => {
+      try {
+        const r = await fetch('/products/' + encodeURIComponent(handle) + '.js', {
+          credentials: 'include',
+          headers: { Accept: 'application/json' }
+        });
+        if (r.status === 429) { rateLimited = true; return; }
+        if (!r.ok) return;
+        const data = await r.json();
+        const variants = Array.isArray(data?.variants) ? data.variants : [];
+        const available = variants.filter((v) => v && v.available === true);
+        if (available.length === 0) { results[handle] = 0; return; }
+        let spots = 0;
+        let hasInventory = false;
+        for (const v of available) {
+          if (typeof v.inventory_quantity === 'number' && Number.isFinite(v.inventory_quantity) && v.inventory_quantity > 0) {
+            hasInventory = true;
+            spots += Math.trunc(v.inventory_quantity);
+          }
+        }
+        if (hasInventory) { results[handle] = spots; }
+      } catch {}
+    }));
+  }
+  return JSON.stringify(results);
+})()
+"@
+            try {
+                $cmdId++
+                $enrichRaw = Invoke-CdpEvaluateString `
+                    -Socket $ws `
+                    -CommandId $cmdId `
+                    -Expression $enrichExpr `
+                    -AwaitPromise `
+                    -TimeoutMilliseconds ($TimeoutSeconds * 1000)
+
+                if ($enrichRaw) {
+                    $eDoc = [System.Text.Json.JsonDocument]::Parse($enrichRaw)
+                    try {
+                        $eRoot = $eDoc.RootElement
+                        if ($eRoot.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                            $eProp = [System.Text.Json.JsonElement]::new()
+                            foreach ($p in $lookupTargets) {
+                                if ($eRoot.TryGetProperty($p.Handle, [ref]$eProp) -and
+                                    $eProp.ValueKind -eq [System.Text.Json.JsonValueKind]::Number) {
+                                    $qty = 0
+                                    if ($eProp.TryGetInt32([ref]$qty)) {
+                                        $p.SpotsLeft = $qty
+                                        $p.HasInventory = $true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    finally {
+                        $eDoc.Dispose()
+                    }
+                }
+            }
+            catch {
+                Write-Verbose "CDP product inventory enrichment skipped: $($_.Exception.Message)"
+            }
+        }
     }
     finally {
         if ($null -ne $ws) {
@@ -1890,6 +2135,26 @@ function Get-CollectionProductsViaHttp {
 
         if ($parsed.RawCount -lt 250) {
             break
+        }
+    }
+
+    $lookupTargets = @(Select-ProductsForInventoryLookup -Products $allProducts.ToArray())
+    foreach ($p in $lookupTargets) {
+        $productJsUrl = "$($script:BaseUrl)/products/$([uri]::EscapeDataString($p.Handle)).js"
+        try {
+            $detailJson = Invoke-CherryHttpRequest -Uri $productJsUrl -MaximumAttempts 1
+            $detailSpots = Get-ProductSpotsFromJsonText -JsonText $detailJson
+            if ($detailSpots -and $detailSpots.HasInventory) {
+                $p.SpotsLeft = $detailSpots.SpotsLeft
+                $p.HasInventory = $true
+            }
+        }
+        catch {
+            $kind = Get-ExceptionKind -Exception $_.Exception
+            Write-Verbose "Could not load product inventory for '$($p.Handle)': $($_.Exception.Message)"
+            if ($kind -in @('RateLimited', 'Blocked')) {
+                break
+            }
         }
     }
 
