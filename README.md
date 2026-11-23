@@ -66,18 +66,20 @@ browser does not avoid.
 By default the script loads every request in a real browser, which passes the
 challenge. Nothing has to be installed on Windows 11:
 
-1. **System Edge/Chrome (no install).** The script runs the Edge or Chrome already
-   on the machine headless (`--dump-dom`), waits for the challenge to finish, and
-   reads the JSON from the page. A profile is kept in `.browser-profile/native`
-   beside the script so Cloudflare's clearance cookie is reused. Verified working on
-   Windows 11 with Edge.
+1. **System Edge/Chrome (no install).** The script drives the Edge or Chrome
+   already on the machine over Chrome DevTools Protocol (`--remote-debugging-port`)
+   in a single headless session, waits for any Cloudflare challenge to resolve,
+   and fetches all collection pages without per-page browser restarts. Clearance
+   cookies are kept in `.browser-profile/native` beside the script (falling back
+   to a temporary profile automatically if `.browser-profile/native` is locked). On
+   Windows, Edge prints `DevTools listening on ws://127.0.0.1:...` to show the
+   browser session is active. Verified working on Windows 11 with Edge.
 2. **Node + Playwright (optional).** If Node.js 20+ is installed and `npm install`
    has been run in the script folder, `Watch-CherryBreaks-FullDescription-PS7.ps1`
    runs an embedded single-session Playwright paginator directly (fetching all
    collection pages in one browser session and reusing `.browser-profile` cookies,
    with no separate `browser-fetch.mjs` process per page). It also works on macOS
-   and Linux, and it supports `-Headed`. If no Chrome/Edge is installed, download
-   Playwright's browser with
+   and Linux. If no Chrome/Edge is installed, download Playwright's browser with
    `npx playwright-core install chromium-headless-shell` (no sudo; verified in WSL).
    Only if it then fails to start on Linux, run
    `sudo npx playwright install-deps chromium`.
@@ -90,7 +92,7 @@ Switches:
 - `-NoBrowser` uses curl / `Invoke-WebRequest` only. It is faster but gets a 403 whenever
   Cloudflare challenges the request.
 - `-UseBrowser` is accepted for compatibility; the browser is already the default.
-- `-Headed` shows the window (Node + Playwright route only).
+- `-Headed` shows the browser window (works with both system Edge/Chrome and Node + Playwright).
 
 If the browser cannot get through, the error says why (for example, a Cloudflare
 page title, or the JSON it received instead of `products`).
