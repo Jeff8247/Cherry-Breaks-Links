@@ -1184,6 +1184,43 @@ function Invoke-CdpEvaluateString {
     }
 }
 
+function Select-CdpPageTarget {
+    param(
+        [AllowEmptyCollection()]
+        [object[]]$Targets
+    )
+
+    $candidates = @(
+        $Targets |
+            Where-Object {
+                $null -ne $_ -and
+                $_.PSObject.Properties['type'] -and
+                $_.type -eq 'page' -and
+                $_.PSObject.Properties['webSocketDebuggerUrl'] -and
+                $_.webSocketDebuggerUrl -and
+                (-not $_.PSObject.Properties['url'] -or
+                    [string]$_.url -notmatch '^(?:edge|chrome|chrome-extension|devtools)://')
+            }
+    )
+
+    if ($candidates.Count -eq 0) {
+        return $null
+    }
+
+    $preferred = $candidates |
+        Where-Object {
+            $_.PSObject.Properties['url'] -and
+            ([string]$_.url -eq 'about:blank' -or [string]$_.url -match '^https?://')
+        } |
+        Select-Object -First 1
+
+    if ($preferred) {
+        return $preferred
+    }
+
+    return $candidates[0]
+}
+
 function Start-NativeBrowserCdpProcess {
     param(
         [Parameter(Mandatory)]
@@ -1208,9 +1245,11 @@ function Start-NativeBrowserCdpProcess {
     $browserArgs.Add("--user-data-dir=$ProfileDir")
     $browserArgs.Add('--no-first-run')
     $browserArgs.Add('--no-default-browser-check')
+    $browserArgs.Add('--disable-sync')
     $browserArgs.Add('--disable-background-mode')
     $browserArgs.Add('--disable-gpu')
     $browserArgs.Add('--disable-extensions')
+    $browserArgs.Add('--log-level=3')
     if (-not $IsWindows) {
         $browserArgs.Add('--no-sandbox')
     }
@@ -1232,7 +1271,12 @@ function Start-NativeBrowserCdpProcess {
     $proc.StartInfo = $psi
     if (-not $proc.Start()) {
         $proc.Dispose()
-        return $null
+        return [pscustomobject]@{
+            Success      = $false
+            Process      = $null
+            WebSocketUrl = ''
+            Reason       = "failed to start process '$BrowserPath'"
+        }
     }
 
     if (-not $IsWindows) {
@@ -1243,29 +1287,42 @@ function Start-NativeBrowserCdpProcess {
 
     $deadline = [datetime]::UtcNow.AddSeconds(15)
     $attempt = 0
+    $lastError = ''
+    $lastTargetsSummary = ''
 
     while ([datetime]::UtcNow -lt $deadline) {
         $attempt++
         if ($proc.HasExited) {
+            $exitCode = $proc.ExitCode
             $proc.Dispose()
-            return $null
+            return [pscustomobject]@{
+                Success      = $false
+                Process      = $null
+                WebSocketUrl = ''
+                Reason       = "browser exited immediately with code $exitCode"
+            }
         }
 
         try {
             $targets = @(Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/list" -NoProxy -TimeoutSec 2)
-            $pageTarget = $targets |
-                Where-Object {
-                    $_.PSObject.Properties['type'] -and
-                    $_.type -eq 'page' -and
-                    $_.PSObject.Properties['webSocketDebuggerUrl'] -and
-                    $_.webSocketDebuggerUrl
-                } |
-                Select-Object -First 1
+            $lastError = ''
+            $lastTargetsSummary = (
+                $targets |
+                    Where-Object { $null -ne $_ } |
+                    ForEach-Object {
+                        $t = if ($_.PSObject.Properties['type']) { [string]$_.type } else { '?' }
+                        $u = if ($_.PSObject.Properties['url']) { [string]$_.url } else { '' }
+                        "$t($u)"
+                    }
+            ) -join ', '
 
+            $pageTarget = Select-CdpPageTarget -Targets $targets
             if ($pageTarget) {
                 return [pscustomobject]@{
+                    Success      = $true
                     Process      = $proc
                     WebSocketUrl = [string]$pageTarget.webSocketDebuggerUrl
+                    Reason       = ''
                 }
             }
 
@@ -1278,18 +1335,24 @@ function Start-NativeBrowserCdpProcess {
                     try {
                         $created = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/new?about:blank" -Method Get -NoProxy -TimeoutSec 2
                     }
-                    catch { }
+                    catch {
+                        $lastError = $_.Exception.Message
+                    }
                 }
 
                 if ($created -and $created.PSObject.Properties['webSocketDebuggerUrl'] -and $created.webSocketDebuggerUrl) {
                     return [pscustomobject]@{
+                        Success      = $true
                         Process      = $proc
                         WebSocketUrl = [string]$created.webSocketDebuggerUrl
+                        Reason       = ''
                     }
                 }
             }
         }
-        catch { }
+        catch {
+            $lastError = $_.Exception.Message
+        }
 
         Start-Sleep -Milliseconds 200
     }
@@ -1304,7 +1367,22 @@ function Start-NativeBrowserCdpProcess {
         $proc.Dispose()
     }
 
-    return $null
+    $reason = if ($lastError) {
+        "DevTools HTTP check failed ($lastError)"
+    }
+    elseif ($lastTargetsSummary) {
+        "no navigable page target in [$lastTargetsSummary]"
+    }
+    else {
+        'timed out waiting for DevTools endpoint'
+    }
+
+    return [pscustomobject]@{
+        Success      = $false
+        Process      = $null
+        WebSocketUrl = ''
+        Reason       = $reason
+    }
 }
 
 function Read-CdpPageBody {
@@ -1452,24 +1530,32 @@ function Get-CollectionProductsViaNativeBrowser {
     $port = Get-FreeTcpPort
     Write-Verbose "Starting system browser via CDP ($browser, port $port)."
     $session = Start-NativeBrowserCdpProcess -BrowserPath $browser -ProfileDir $activeProfileDir -Port $port
+    $firstReason = $session.Reason
 
-    if (-not $session) {
+    if (-not $session.Success) {
         # Edge/Chrome may exit immediately if another running instance holds the profile lock;
         # retry once with a fresh isolated profile directory.
+        Write-Verbose "Persistent CDP startup failed ($firstReason); retrying with isolated profile."
         $activeProfileDir = Join-Path ([System.IO.Path]::GetTempPath()) "cherry-browser-$([guid]::NewGuid().ToString('N'))"
         $cleanupTempProfile = $true
         $port = Get-FreeTcpPort
-        Write-Verbose "Persistent profile did not start CDP; retrying with isolated profile ($activeProfileDir, port $port)."
+        Write-Verbose "Retrying CDP with isolated profile ($activeProfileDir, port $port)."
         $session = Start-NativeBrowserCdpProcess -BrowserPath $browser -ProfileDir $activeProfileDir -Port $port
     }
 
-    if (-not $session) {
+    if (-not $session.Success) {
         if ($cleanupTempProfile -and (Test-Path -LiteralPath $activeProfileDir)) {
             Remove-Item -LiteralPath $activeProfileDir -Recurse -Force -ErrorAction SilentlyContinue
         }
+        $detail = if ($firstReason -and $session.Reason -and $firstReason -ne $session.Reason) {
+            "persistent profile: $firstReason; temp profile: $($session.Reason)"
+        }
+        else {
+            $session.Reason
+        }
         throw (New-CherryRequestException `
             -Kind 'BrowserUnavailable' `
-            -Message "Browser fallback failed: could not connect to $browser DevTools endpoint.")
+            -Message "Browser fallback failed: could not connect to $browser DevTools endpoint ($detail).")
     }
 
     $proc = $session.Process
