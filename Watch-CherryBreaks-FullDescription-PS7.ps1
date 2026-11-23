@@ -184,25 +184,28 @@ $script:NormalizeBeforeSpotsRegex = [regex]::new("\s+[$separatorChars]+\s+(?=(?:
 $script:MultiSpaceRegex = [regex]::new('\s{2,}', $script:RegexCompiled)
 
 $emojiFootball = [char]::ConvertFromUtf32(0x1F3C8)
+$emojiRugby = [char]::ConvertFromUtf32(0x1F3C9)
 $emojiBasketball = [char]::ConvertFromUtf32(0x1F3C0)
 $emojiBaseball = [char]::ConvertFromUtf32(0x26BE)
 $emojiHockey = [char]::ConvertFromUtf32(0x1F3D2)
 $emojiSoccer = [char]::ConvertFromUtf32(0x26BD)
 $emojiTennis = [char]::ConvertFromUtf32(0x1F3BE)
-$emojiWrestling = [char]::ConvertFromUtf32(0x1F93C) + [char]::ConvertFromUtf32(0x200D) +
-    [char]::ConvertFromUtf32(0x2642) + [char]::ConvertFromUtf32(0xFE0F)
+$emojiUfc = [char]::ConvertFromUtf32(0x1F94A)
+$emojiWrestling = [char]::ConvertFromUtf32(0x1F93C)
 
-# Order matters: daily names take precedence, and soccer precedes Topps/MLB/Bowman.
+# Order matters: daily names take precedence, and soccer / AFL-NRL precede Football and Topps/MLB/Bowman.
 $script:SportEmojiRules = @(
     [pscustomobject]@{ Regex = [regex]::new('\b(?:Lil\s+)?(?:Punterz|Squadz)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiFootball }
     [pscustomobject]@{ Regex = [regex]::new('\b(?:Lil\s+)?Teamz\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiBasketball }
     [pscustomobject]@{ Regex = [regex]::new('\b(?:Lil\s+)?Derby\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiBaseball }
     [pscustomobject]@{ Regex = [regex]::new('\b(?:Lil\s+)?Slapperz\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiHockey }
     [pscustomobject]@{ Regex = [regex]::new('\b(?:Soccer|EPL|UCL|UEFA|FIFA|Premier League|Champions League|La Liga|LaLiga|Bundesliga|Serie A|Ligue 1|MLS|World Cup|Euro 20\d{2})\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiSoccer }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:AFL|AFLW|NRL|NRLW|NRLWC|RLWC|Aussie Rules|Rugby)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiRugby }
     [pscustomobject]@{ Regex = [regex]::new('\b(?:NBA|Basketball)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiBasketball }
-    [pscustomobject]@{ Regex = [regex]::new('\b(?:NFL|American Football|Gridiron)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiFootball }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:NFL|American Football|Gridiron|Football)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiFootball }
     [pscustomobject]@{ Regex = [regex]::new('\b(?:NHL|Hockey)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiHockey }
     [pscustomobject]@{ Regex = [regex]::new('\b(?:Tennis|ATP|WTA)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiTennis }
+    [pscustomobject]@{ Regex = [regex]::new('\b(?:UFC|MMA)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiUfc }
     [pscustomobject]@{ Regex = [regex]::new('\b(?:WWE|AEW|MLW|Wrestling|Wrestler|Wrestlers)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiWrestling }
     [pscustomobject]@{ Regex = [regex]::new('\b(?:MLB|Baseball|Bowman)\b', $script:RegexIgnoreCaseCompiled); Emoji = $emojiBaseball }
 )
